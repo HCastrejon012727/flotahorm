@@ -79,7 +79,7 @@ function getMsal(){
 async function getToken(){
   const app=getMsal();
   await app.initialize();
-  const scopes=["https://graph.microsoft.com/Sites.ReadWrite.All","https://graph.microsoft.com/Lists.ReadWrite.All"];
+  const scopes=["https://graph.microsoft.com/Sites.ReadWrite.All","https://graph.microsoft.com/User.Read"];
   const accounts=app.getAllAccounts();
   if(accounts.length>0){
     try{
