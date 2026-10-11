@@ -1,0 +1,1606 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Gestión de Flota — Hormigoneras</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:#F0F4FA;color:#1A2540;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#F0F4FA}
+::-webkit-scrollbar-thumb{background:#C5D0E6;border-radius:3px}
+input,select,textarea,button{font-family:inherit}
+table{border-collapse:collapse}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const {useState,useEffect,useMemo,useCallback,createElement:h,Fragment}=React;
+
+const MARCAS=["Mercedes-Benz","Volvo","DAF","Scania","MAN","Renault"];
+const ESTADOS_VEH=["Operativo","En taller","Fuera de servicio","Baja"];
+const TIPOS_OT=["Revisión diaria","Mant. preventivo","Reparación taller propio","Reparación taller externo","ITV / Inspección","Otro"];
+const NIVELES=["N1 – Crítica","N2 – Urgente","N3 – Programable"];
+const ESTADOS_OT=["Abierta","En progreso","Pte. recambio","Cerrada","Cancelada"];
+const TIPOS_INF=["Velocidad","Semáforo / señal","Tacógrafo","Peso / carga","Documentación","Aparcamiento","Móvil al volante","Otra"];
+const ESTADOS_SAN=["Pendiente","Pagada","Recurrida","Anulada","Pagada con dto."];
+// Posiciones neumático numeradas 1-40 (ruedas)
+const POSICIONES_NEU=Array.from({length:40},(_,i)=>`Posición ${i+1}`).concat(["Delantero izquierdo","Delantero derecho","Trasero izq. exterior","Trasero izq. interior","Trasero der. exterior","Trasero der. interior"]);
+const MOTIVOS_NEU=["Desgaste normal","Pinchazo","Corte lateral","Reventado","Desgaste irregular","Vida útil agotada"];
+const TIPOS_EXT=["Extintor cabina","Extintor chasis","Triángulos emergencia","Chaleco reflectante","Botiquín","Cinturón seguridad","ITV","Seguro","Otro"];
+const ESTADOS_EXT=["Vigente","Caducado","En revisión","No aplica"];
+const ESTADOS_SEGURO=["Vigente","Vencido","En renovación","Cancelado"];
+const TIPOS_SINIESTRO=["Colisión","Vuelco","Incendio","Robo","Daños propios","Daños a terceros","Rotura cristales","Otro"];
+const MECANICOS_INI=[
+  {id:"m1",nombre:"Carlos García López",turno:"Mañana 06:00–14:00",unidades:"H-01 a H-15",tel:"600 111 001",activo:true},
+  {id:"m2",nombre:"Pedro Martínez Ruiz",turno:"Mañana 06:00–14:00",unidades:"H-16 a H-30",tel:"600 111 002",activo:true},
+  {id:"m3",nombre:"Antonio Sánchez Mora",turno:"Tarde 14:00–22:00",unidades:"H-31 a H-45",tel:"600 111 003",activo:true},
+  {id:"m4",nombre:"Miguel Fernández Vega",turno:"Tarde 14:00–22:00",unidades:"H-46 a H-60",tel:"600 111 004",activo:true},
+];
+
+const uid=()=>Math.random().toString(36).slice(2,9);
+const hoy=()=>new Date().toISOString().slice(0,10);
+const diasHasta=f=>f?Math.round((new Date(f)-new Date())/86400000):null;
+
+/* ══════════════════════════════════════════════
+   SHAREPOINT / MICROSOFT GRAPH  —  capa de datos
+   ══════════════════════════════════════════════ */
+const SP_CONFIG={
+  clientId:"0751fa45-b227-43e4-b63d-a853e1f57875",
+  tenantId:"6e00077c-b1b6-4189-9a0c-551e6be7d6be",
+  siteUrl:"https://hormigonescastrejon.sharepoint.com/sites/Flotadevehculos",
+  // Las listas se crean automáticamente la primera vez que se guarda
+  listas:["vehiculos","intervenciones","aceite","neumaticos","sanciones","extintores","seguros"],
+};
+
+// MSAL instance (singleton)
+let _msalApp=null;
+let _spSiteId=null;
+let _listIds={}; // listName -> listId
+
+function getMsal(){
+  if(!_msalApp){
+    _msalApp=new msal.PublicClientApplication({
+      auth:{clientId:SP_CONFIG.clientId,authority:`https://login.microsoftonline.com/${SP_CONFIG.tenantId}`,redirectUri:window.location.href.split("?")[0].split("#")[0]},
+      cache:{cacheLocation:"sessionStorage",storeAuthStateInCookie:false},
+    });
+  }
+  return _msalApp;
+}
+
+async function getToken(){
+  const app=getMsal();
+  await app.initialize();
+  const scopes=["https://graph.microsoft.com/Sites.ReadWrite.All","https://graph.microsoft.com/Lists.ReadWrite.All"];
+  const accounts=app.getAllAccounts();
+  if(accounts.length>0){
+    try{
+      const r=await app.acquireTokenSilent({scopes,account:accounts[0]});
+      return r.accessToken;
+    }catch{}
+  }
+  const r=await app.acquireTokenPopup({scopes});
+  return r.accessToken;
+}
+
+async function graphFetch(path,opts={}){
+  const token=await getToken();
+  const res=await fetch(`https://graph.microsoft.com/v1.0${path}`,{
+    ...opts,
+    headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json",...(opts.headers||{})},
+    body:opts.body?JSON.stringify(opts.body):undefined,
+  });
+  if(!res.ok){const t=await res.text();throw new Error(`Graph ${res.status}: ${t}`);}
+  if(res.status===204)return null;
+  return res.json();
+}
+
+// Obtener siteId de SharePoint
+async function getSiteId(){
+  if(_spSiteId)return _spSiteId;
+  const host="hormigonescastrejon.sharepoint.com";
+  const sitePath="/sites/Flotadevehculos";
+  const data=await graphFetch(`/sites/${host}:${sitePath}`);
+  _spSiteId=data.id;
+  return _spSiteId;
+}
+
+// Obtener o crear lista por nombre
+async function getListId(listName){
+  if(_listIds[listName])return _listIds[listName];
+  const siteId=await getSiteId();
+  // Buscar lista existente
+  try{
+    const data=await graphFetch(`/sites/${siteId}/lists?$filter=displayName eq '${listName}'&$select=id,displayName`);
+    if(data.value&&data.value.length>0){
+      _listIds[listName]=data.value[0].id;
+      return _listIds[listName];
+    }
+  }catch{}
+  // Crear lista nueva con campo "payload" (JSON comprimido) + campo "itemId" (título)
+  const created=await graphFetch(`/sites/${siteId}/lists`,{
+    method:"POST",
+    body:{displayName:listName,list:{template:"genericList"},columns:[
+      {name:"itemId",text:{},indexed:true},
+      {name:"payload",text:{allowMultipleLines:true,maxLength:0}},
+    ]},
+  });
+  _listIds[listName]=created.id;
+  return _listIds[listName];
+}
+
+// Leer todos los items de una lista → array de objetos JS
+async function spLoad(listName){
+  try{
+    const siteId=await getSiteId();
+    const listId=await getListId(listName);
+    let items=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=itemId,payload)&$top=500`;
+    while(url){
+      const data=await graphFetch(url);
+      items=[...items,...(data.value||[])];
+      url=data["@odata.nextLink"]?data["@odata.nextLink"].replace("https://graph.microsoft.com/v1.0",""):null;
+    }
+    return items.map(i=>{try{return JSON.parse(i.fields.payload);}catch{return null;}}).filter(Boolean);
+  }catch(e){console.warn(`spLoad ${listName}:`,e);return[];}
+}
+
+// Guardar array completo: upsert por itemId usando el campo "id" del objeto
+async function spSave(listName,items){
+  try{
+    const siteId=await getSiteId();
+    const listId=await getListId(listName);
+    // Obtener items existentes para saber cuáles actualizar vs crear
+    let existing=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=id,itemId)&$top=500`;
+    while(url){
+      const data=await graphFetch(url);
+      existing=[...existing,...(data.value||[])];
+      url=data["@odata.nextLink"]?data["@odata.nextLink"].replace("https://graph.microsoft.com/v1.0",""):null;
+    }
+    const existMap={};
+    existing.forEach(e=>{if(e.fields?.itemId)existMap[e.fields.itemId]=e.id;});
+    // Ids que ya no están → borrar
+    const newIds=new Set(items.map(i=>i.id));
+    const toDelete=existing.filter(e=>e.fields?.itemId&&!newIds.has(e.fields.itemId));
+    // Lanzar todo en paralelo por lotes de 10
+    const batch=async(arr,fn)=>{for(let i=0;i<arr.length;i+=10)await Promise.all(arr.slice(i,i+10).map(fn));};
+    await batch(toDelete,e=>graphFetch(`/sites/${siteId}/lists/${listId}/items/${e.id}`,{method:"DELETE"}));
+    await batch(items,item=>{
+      const spId=existMap[item.id];
+      const body={fields:{itemId:item.id,Title:item.id,payload:JSON.stringify(item)}};
+      if(spId)return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
+      return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
+    });
+  }catch(e){console.warn(`spSave ${listName}:`,e);}
+}
+
+function genVehiculos(){
+  const mods={"Mercedes-Benz":["Arocs 3543 B","Arocs 3240"],"Volvo":["FMX 460","FMX 500"],"DAF":["CF 480 FAR","CF 530"],"Scania":["G 450 B6x4","R 500"],"MAN":["TGS 26.400","TGS 33.460"],"Renault":["C 430 P6x4","C 460"]};
+  const L="ABCDEFGHJKLMNPRSTUVWXYZ";
+  const rng=(a,b)=>a+Math.floor((b-a)*((Math.sin(a*b+17)*43758.5453)%1+1)%1);
+  return Array.from({length:60},(_,i)=>{
+    const n=i+1, marca=MARCAS[i%MARCAS.length];
+    const km=50000+rng(n*100,n*100+280000);
+    const d=new Date(); d.setDate(d.getDate()+(-20+rng(n,n+380)));
+    const ds=new Date(); ds.setDate(ds.getDate()+(30+rng(n*2,n*2+300)));
+    const ult=km-rng(n*10,n*10+17000);
+    return{id:`v${n}`,codigo:`H-${String(n).padStart(2,"0")}`,
+      matricula:`${1000+n*13}-${L[n%L.length]}${L[(n+5)%L.length]}${L[(n+10)%L.length]}`,
+      marca,modelo:mods[marca][n%2],anio:2016+(n%8),bastidor:`VIN${String(n).padStart(15,"0")}`,
+      km,estado:n===3?"En taller":n===7?"Fuera de servicio":"Operativo",
+      itv:d.toISOString().slice(0,10),
+      seguroVto:ds.toISOString().slice(0,10),
+      seguroCompania:"",seguroPoliza:"",seguroTipo:"Todo riesgo",
+      tacoMarca:"",tacoModelo:"",tacoCodigo:"",tacoFechaRenov:"",
+      intervaloAceite:20000,tipoAceite:"15W-40",litrosAceite:22,
+      filtrosNota:"",
+      conductorHabitual:"",mecanico:MECANICOS_INI[n%4].id,kmUltAceite:ult,
+      proveedor:"",fechaCompra:"",precio:0,obs:""};
+  });
+}
+
+const C={
+  nav:"#0D2B5A",navText:"#fff",navSub:"#7FB3E8",
+  acc:"#1B5CB5",accH:"#154ea0",
+  bg:"#F0F4FA",card:"#fff",bdr:"#DDE3EE",
+  txt:"#1A2540",txtS:"#5A6882",txtM:"#9BA8C0",
+  red:"#C00000",redB:"#FFF0F0",redD:"#FFCCCC",
+  ora:"#C55A11",oraB:"#FFF4ED",oraD:"#FFCFAE",
+  yel:"#856400",yelB:"#FFFAEB",yelD:"#FFE88A",
+  grn:"#1E6B2E",grnB:"#F0FAF2",grnD:"#A8DFB5",
+  gry:"#5A6882",gryB:"#F2F5FA",gryD:"#DDE3EE",
+  blu:"#1B5CB5",bluB:"#EBF3FF",bluD:"#B5D4F4",
+  pur:"#6B21A8",purB:"#F5F0FF",purD:"#D8B4FE",
+};
+const AC={
+  red:{bg:C.redB,bdr:C.redD,txt:C.red},
+  orange:{bg:C.oraB,bdr:C.oraD,txt:C.ora},
+  yellow:{bg:C.yelB,bdr:C.yelD,txt:C.yel},
+  green:{bg:C.grnB,bdr:C.grnD,txt:C.grn},
+  gray:{bg:C.gryB,bdr:C.gryD,txt:C.gry},
+  blue:{bg:C.bluB,bdr:C.bluD,txt:C.blu},
+  purple:{bg:C.purB,bdr:C.purD,txt:C.pur},
+};
+const EC={
+  "Operativo":{bg:C.grnB,bdr:C.grnD,txt:C.grn},
+  "En taller":{bg:C.oraB,bdr:C.oraD,txt:C.ora},
+  "Fuera de servicio":{bg:C.redB,bdr:C.redD,txt:C.red},
+  "Baja":{bg:C.gryB,bdr:C.gryD,txt:C.gry},
+};
+const OEC={
+  "Abierta":{bg:C.yelB,bdr:C.yelD,txt:C.yel},
+  "En progreso":{bg:C.bluB,bdr:C.bluD,txt:C.blu},
+  "Pte. recambio":{bg:C.oraB,bdr:C.oraD,txt:C.ora},
+  "Cerrada":{bg:C.grnB,bdr:C.grnD,txt:C.grn},
+  "Cancelada":{bg:C.gryB,bdr:C.gryD,txt:C.gry},
+};
+
+const alertaFecha=(f,d1=30,d2=60)=>{const d=diasHasta(f);if(d===null)return{t:"Sin fecha",c:"gray"};if(d<0)return{t:`⛔ Vencida`,c:"red"};if(d<d1)return{t:`⚠ ${d}d`,c:"red"};if(d<d2)return{t:`⚠ ${d}d`,c:"orange"};return{t:"✔ OK",c:"green"};};
+const alertaITV=itv=>alertaFecha(itv,30,60);
+const alertaSeguro=f=>alertaFecha(f,30,60);
+const alertaTaco=f=>alertaFecha(f,30,60);
+const alertaAce=(km,ult,int)=>{if(!ult&&ult!==0)return{t:"Sin datos",c:"gray"};const p=(+ult)+(+int||20000);const rest=p-(+km);if(rest<=0)return{t:"⛔ Vencido",c:"red"};if(rest<=2000)return{t:`⚠ ${rest.toLocaleString()}km`,c:"orange"};return{t:`✔ ${rest.toLocaleString()}km`,c:"green"};};
+
+function Badge({label,scheme="gray",sm=true}){
+  const s=AC[scheme]||AC.gray;
+  return h("span",{style:{background:s.bg,border:`1px solid ${s.bdr}`,color:s.txt,borderRadius:99,padding:sm?"2px 8px":"3px 11px",fontSize:sm?11:12,fontWeight:600,whiteSpace:"nowrap",display:"inline-block"}},label);
+}
+
+function Btn({children,onClick,variant="primary",sm,full,type="button",disabled}){
+  const v={primary:{background:disabled?"#9BA8C0":C.acc,color:"#fff",border:"none"},ghost:{background:"transparent",color:C.acc,border:`1px solid ${C.bdr}`},danger:{background:C.red,color:"#fff",border:"none"},warn:{background:C.ora,color:"#fff",border:"none"}};
+  const s=v[variant]||v.primary;
+  return h("button",{type,onClick,disabled,style:{...s,padding:sm?"5px 12px":"7px 16px",borderRadius:7,cursor:disabled?"not-allowed":"pointer",fontSize:sm?12:13,fontWeight:500,width:full?"100%":"auto",opacity:disabled?.6:1}},children);
+}
+
+function Inp({label,value,onChange,type="text",opts,optsObj,req,hint,disabled,rows,min,max,step,small,placeholder}){
+  const inputStyle={width:"100%",padding:"7px 10px",borderRadius:6,border:`1px solid ${C.bdr}`,background:disabled?"#f5f5f5":C.card,color:C.txt,fontSize:small?12:13};
+  return h("div",{style:{marginBottom:10}},
+    label&&h("label",{style:{display:"block",fontSize:12,fontWeight:500,color:C.txtS,marginBottom:3}},label,req&&h("span",{style:{color:C.red}}," *")),
+    opts?h("select",{value:value||"",onChange:e=>onChange(e.target.value),disabled,style:inputStyle},
+      h("option",{value:""},"— Seleccionar —"),
+      opts.map(o=>h("option",{key:o,value:o},o))
+    ):rows?h("textarea",{value:value||"",onChange:e=>onChange(e.target.value),rows,style:{...inputStyle,resize:"vertical"},placeholder}):
+    h("input",{type,value:value??""  ,onChange:e=>onChange(e.target.value),disabled,min,max,step,style:inputStyle,placeholder}),
+    hint&&h("p",{style:{fontSize:11,color:C.txtM,marginTop:2}},hint)
+  );
+}
+
+// Inp con campo de texto libre para marca (permite seleccionar lista O escribir)
+function InpMarca({label,value,onChange,req}){
+  const MARCAS_NEU=["Michelin","Bridgestone","Continental","Goodyear","Pirelli","Dunlop","BKT","Hankook","Toyo","Yokohama"];
+  const inputStyle={width:"100%",padding:"7px 10px",borderRadius:6,border:`1px solid ${C.bdr}`,background:C.card,color:C.txt,fontSize:13};
+  return h("div",{style:{marginBottom:10}},
+    h("label",{style:{display:"block",fontSize:12,fontWeight:500,color:C.txtS,marginBottom:3}},label,req&&h("span",{style:{color:C.red}}," *")),
+    h("input",{list:"marcas-neu-list",value:value||"",onChange:e=>onChange(e.target.value),style:inputStyle,placeholder:"Seleccionar o escribir marca"}),
+    h("datalist",{id:"marcas-neu-list"},MARCAS_NEU.map(m=>h("option",{key:m,value:m})))
+  );
+}
+
+function Card({children,style}){return h("div",{style:{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:10,padding:"14px 16px",...style}},children);}
+
+function Modal({title,onClose,children,wide}){
+  return h("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}},
+    h("div",{style:{background:C.card,borderRadius:12,width:"100%",maxWidth:wide?780:520,maxHeight:"92vh",overflow:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.25)"}},
+      h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"13px 20px",borderBottom:`1px solid ${C.bdr}`,position:"sticky",top:0,background:C.card,zIndex:1}},
+        h("h3",{style:{margin:0,fontSize:15,color:C.txt}},title),
+        h("button",{onClick:onClose,style:{background:"none",border:"none",cursor:"pointer",fontSize:22,color:C.txtS,lineHeight:1}},"×")
+      ),
+      h("div",{style:{padding:"16px 20px"}},children)
+    )
+  );
+}
+
+function Tabs({tabs,active,onChange}){
+  return h("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginBottom:14}},
+    tabs.map(t=>h("button",{key:t.id,onClick:()=>onChange(t.id),style:{padding:"6px 13px",borderRadius:7,border:`1px solid ${active===t.id?C.acc:C.bdr}`,background:active===t.id?C.acc:C.card,color:active===t.id?"#fff":C.txtS,fontSize:12,fontWeight:500,cursor:"pointer"}},t.label))
+  );
+}
+
+function Stat({label,value,sub,scheme="blue"}){
+  const s=AC[scheme]||AC.blue;
+  return h("div",{style:{background:s.bg,border:`1px solid ${s.bdr}`,borderRadius:10,padding:"12px 14px",textAlign:"center"}},
+    h("div",{style:{fontSize:10,color:s.txt,fontWeight:700,marginBottom:3,textTransform:"uppercase",letterSpacing:.5}},label),
+    h("div",{style:{fontSize:24,fontWeight:800,color:s.txt,lineHeight:1}},value),
+    sub&&h("div",{style:{fontSize:10,color:s.txt,marginTop:3,opacity:.8}},sub)
+  );
+}
+
+function Grid2({children}){return h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 16px"}},children);}
+function Loader(){return h("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"60vh",gap:12}},
+  h("div",{style:{width:40,height:40,border:`3px solid ${C.bluD}`,borderTopColor:C.acc,borderRadius:"50%",animation:"spin 1s linear infinite"}}),
+  h("style",null,"@keyframes spin{to{transform:rotate(360deg)}}"),
+  h("span",{style:{color:C.txtS,fontSize:13}},"Cargando datos de flota..."));}
+
+/* ── Dashboard ── */
+function Dashboard({vehiculos,intervenciones,sanciones,extintores,seguros,onSelectVeh}){
+  const op=vehiculos.filter(v=>v.estado==="Operativo").length;
+  const et=vehiculos.filter(v=>v.estado==="En taller").length;
+  const itvA=vehiculos.filter(v=>{const d=diasHasta(v.itv);return d!==null&&d<60;});
+  const segA=vehiculos.filter(v=>{const d=diasHasta(v.seguroVto);return d!==null&&d<60;});
+  const tacoA=vehiculos.filter(v=>{const d=diasHasta(v.tacoFechaRenov);return v.tacoFechaRenov&&d!==null&&d<60;});
+  const aceA=vehiculos.filter(v=>{const p=(+v.kmUltAceite)+(+v.intervaloAceite||20000);return(+v.km)>=(p-2000);});
+  const otsA=intervenciones.filter(o=>o.estadoOT==="Abierta"||o.estadoOT==="En progreso");
+  const otsPropias=otsA.filter(o=>!o.tallerExterno);
+  const otsExternas=otsA.filter(o=>o.tallerExterno);
+  const sanP=sanciones.filter(s=>s.estado==="Pendiente");
+  const extC=extintores.filter(e=>e.estado==="Caducado"||(e.proximaRev&&diasHasta(e.proximaRev)<30));
+
+  const alertasUrgentes=[
+    ...otsA.filter(o=>o.nivel==="N1 – Crítica").map(o=>({tipo:"N1",vId:o.vehiculoId,txt:o.sintoma||o.tipo,c:"red",badge:"N1 CRÍTICA"})),
+    ...itvA.map(v=>({tipo:"ITV",vId:v.id,txt:`Vence ${diasHasta(v.itv)<0?"hace "+Math.abs(diasHasta(v.itv))+"d":"en "+diasHasta(v.itv)+"d"}`,c:"orange",badge:"ITV"})),
+    ...segA.map(v=>({tipo:"SEG",vId:v.id,txt:`Seguro vence ${diasHasta(v.seguroVto)<0?"hace "+Math.abs(diasHasta(v.seguroVto))+"d":"en "+diasHasta(v.seguroVto)+"d"}`,c:"orange",badge:"SEGURO"})),
+    ...tacoA.map(v=>({tipo:"TACO",vId:v.id,txt:`Tacógrafo renovar ${diasHasta(v.tacoFechaRenov)<0?"hace "+Math.abs(diasHasta(v.tacoFechaRenov))+"d":"en "+diasHasta(v.tacoFechaRenov)+"d"}`,c:"yellow",badge:"TACÓGRAFO"})),
+    ...extC.map(e=>({tipo:"EXT",vId:e.vehiculoId,txt:`${e.tipoElem}: ${e.estado}`,c:"red",badge:"EXTINTOR"})),
+    ...sanP.map(s=>({tipo:"SAN",vId:s.vehiculoId,txt:`${s.tipo||"Infracción"} ${s.importe?s.importe+"€":""}`,c:"orange",badge:"SANCIÓN"})),
+  ];
+
+  return h("div",null,
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(115px,1fr))",gap:8,marginBottom:16}},
+      h(Stat,{label:"Total flota",value:vehiculos.length,scheme:"blue"}),
+      h(Stat,{label:"Operativos",value:op,scheme:"green"}),
+      h(Stat,{label:"En taller",value:et,scheme:et>0?"orange":"green"}),
+      h(Stat,{label:"OTs taller propio",value:otsPropias.length,scheme:otsPropias.length>0?"yellow":"green"}),
+      h(Stat,{label:"OTs taller externo",value:otsExternas.length,scheme:otsExternas.length>0?"orange":"green"}),
+      h(Stat,{label:"Alertas ITV",value:itvA.length,scheme:itvA.length>0?"red":"green"}),
+      h(Stat,{label:"Alertas seguro",value:segA.length,scheme:segA.length>0?"red":"green"}),
+      h(Stat,{label:"Alertas tacógrafo",value:tacoA.length,scheme:tacoA.length>0?"orange":"green"}),
+      h(Stat,{label:"Extint./seg.",value:extC.length,scheme:extC.length>0?"red":"green",sub:"por revisar"}),
+      h(Stat,{label:"Sanciones",value:sanP.length,scheme:sanP.length>0?"red":"green"}),
+    ),
+
+    alertasUrgentes.length>0&&h(Card,{style:{marginBottom:14,borderLeft:`4px solid ${C.red}`}},
+      h("div",{style:{fontWeight:700,fontSize:13,color:C.red,marginBottom:8}},"⚡ Requieren atención — "+alertasUrgentes.length+" alertas"),
+      h("div",{style:{display:"flex",flexDirection:"column",gap:5}},
+        alertasUrgentes.slice(0,12).map((a,i)=>{
+          const v=vehiculos.find(x=>x.id===a.vId);
+          return h("div",{key:i,style:{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",background:AC[a.c]?.bg||C.oraB,border:`1px solid ${AC[a.c]?.bdr||C.oraD}`,borderRadius:7,fontSize:12,cursor:"pointer"},onClick:()=>v&&onSelectVeh(v)},
+            h(Badge,{label:a.badge,scheme:a.c}),
+            h("span",null,h("strong",null,v?.codigo||"")," · ",a.txt)
+          );
+        })
+      )
+    ),
+
+    otsA.length>0&&h(Card,{style:{marginBottom:14}},
+      h("div",{style:{display:"flex",gap:16,flexWrap:"wrap",alignItems:"center",marginBottom:8}},
+        h("div",{style:{fontWeight:700,fontSize:13,color:C.txt}},`OTs en curso (${otsA.length})`),
+        h("span",{style:{fontSize:11,color:C.grn,background:C.grnB,border:`1px solid ${C.grnD}`,borderRadius:99,padding:"2px 8px"}},`🏭 Propio: ${otsPropias.length}`),
+        h("span",{style:{fontSize:11,color:C.ora,background:C.oraB,border:`1px solid ${C.oraD}`,borderRadius:99,padding:"2px 8px"}},`🔧 Externo: ${otsExternas.length}`),
+      ),
+      h("div",{style:{display:"flex",flexDirection:"column",gap:4}},
+        otsA.slice(0,10).map(o=>{
+          const v=vehiculos.find(x=>x.id===o.vehiculoId);
+          const ec=OEC[o.estadoOT]||OEC["Abierta"];
+          return h("div",{key:o.id,style:{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",background:C.gryB,borderRadius:7,cursor:"pointer",flexWrap:"wrap"},onClick:()=>v&&onSelectVeh(v)},
+            h("strong",{style:{color:C.acc,fontSize:12,minWidth:36}},v?.codigo),
+            h("span",{style:{background:ec.bg,color:ec.txt,border:`1px solid ${ec.bdr}`,borderRadius:99,padding:"1px 7px",fontSize:11,fontWeight:600}},o.estadoOT),
+            o.nivel&&h(Badge,{label:o.nivel,scheme:o.nivel.startsWith("N1")?"red":o.nivel.startsWith("N2")?"orange":"green"}),
+            o.tallerExterno&&h("span",{style:{fontSize:10,color:C.ora,background:C.oraB,border:`1px solid ${C.oraD}`,borderRadius:99,padding:"1px 6px",fontWeight:600}},"EXTERNO"),
+            h("span",{style:{fontSize:12,color:C.txtS,flex:1}},o.tipo,o.proveedorTaller?` · ${o.proveedorTaller}`:""),
+            h("span",{style:{fontSize:11,color:C.txtM}},o.fecha)
+          );
+        })
+      )
+    ),
+
+    aceA.length>0&&h(Card,null,
+      h("div",{style:{fontWeight:700,fontSize:13,color:C.txt,marginBottom:8}},`Aceite próximo/vencido (${aceA.length})`),
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}},
+        aceA.slice(0,12).map(v=>{
+          const al=alertaAce(v.km,v.kmUltAceite,v.intervaloAceite);
+          return h("div",{key:v.id,style:{background:AC[al.c]?.bg||C.yelB,border:`1px solid ${AC[al.c]?.bdr||C.yelD}`,borderRadius:7,padding:"8px 10px",cursor:"pointer"},onClick:()=>onSelectVeh(v)},
+            h("div",{style:{fontWeight:700,fontSize:12,color:C.acc}},v.codigo),
+            h("div",{style:{fontSize:11,color:C.txtS}},v.matricula),
+            h("div",{style:{fontSize:11,color:AC[al.c]?.txt||C.yel,fontWeight:600,marginTop:3}},al.t)
+          );
+        })
+      )
+    )
+  );
+}
+
+/* ── Importar Km ── */
+function ImportarKm({vehiculos,setVehiculos,onClose}){
+  const [paso,setPaso]=useState("upload"); // upload | preview | done
+  const [filas,setFilas]=useState([]);
+  const [errores,setErrores]=useState([]);
+  const [actualizados,setActualizados]=useState([]);
+  const [fechaLect,setFechaLect]=useState(hoy());
+
+  const leerArchivo=e=>{
+    const file=e.target.files[0];
+    if(!file)return;
+    const ext=file.name.split(".").pop().toLowerCase();
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      try{
+        let rows=[];
+        if(ext==="csv"||ext==="txt"){
+          const txt=ev.target.result;
+          const lines=txt.split(/\r?\n/).filter(l=>l.trim());
+          if(lines.length<2){setErrores(["El archivo CSV está vacío o no tiene filas de datos."]);return;}
+          // Detectar separador: ; o ,
+          const sep=lines[0].includes(";")?";":","
+          const heads=lines[0].split(sep).map(h=>h.trim().toLowerCase().replace(/"/g,""));
+          // Buscar columnas por nombre flexible
+          const iMat=heads.findIndex(h=>h.includes("matric")||h==="matricula"||h==="mat");
+          const iKm=heads.findIndex(h=>h.includes("km")||h.includes("kil")||h==="odometro");
+          const iFecha=heads.findIndex(h=>h.includes("fecha")||h==="date");
+          if(iMat<0||iKm<0){setErrores([`No se encontraron columnas de matrícula y km. Cabeceras detectadas: ${heads.join(", ")}`]);return;}
+          rows=lines.slice(1).map(l=>{
+            const cols=l.split(sep).map(c=>c.trim().replace(/"/g,""));
+            return{matricula:(cols[iMat]||"").toUpperCase(),km:parseInt((cols[iKm]||"").replace(/\./g,"").replace(",","")),fecha:iFecha>=0?cols[iFecha]:fechaLect};
+          }).filter(r=>r.matricula&&!isNaN(r.km));
+        } else {
+          // Excel
+          const wb=XLSX.read(ev.target.result,{type:"binary"});
+          const ws=wb.Sheets[wb.SheetNames[0]];
+          const data=XLSX.utils.sheet_to_json(ws,{defval:""});
+          if(!data.length){setErrores(["La hoja Excel no contiene datos."]);return;}
+          const heads=Object.keys(data[0]).map(k=>k.toLowerCase());
+          const kMat=Object.keys(data[0]).find(k=>k.toLowerCase().includes("matric")||k.toLowerCase()==="matricula"||k.toLowerCase()==="mat");
+          const kKm=Object.keys(data[0]).find(k=>k.toLowerCase().includes("km")||k.toLowerCase().includes("kil")||k.toLowerCase()==="odometro");
+          const kFecha=Object.keys(data[0]).find(k=>k.toLowerCase().includes("fecha")||k.toLowerCase()==="date");
+          if(!kMat||!kKm){setErrores([`Columnas no encontradas. Cabeceras Excel: ${Object.keys(data[0]).join(", ")}\n\nNecesito columnas con 'matricula' y 'km'.`]);return;}
+          rows=data.map(r=>({
+            matricula:String(r[kMat]||"").toUpperCase().trim(),
+            km:parseInt(String(r[kKm]||"0").replace(/\./g,"").replace(",","")),
+            fecha:kFecha&&r[kFecha]?String(r[kFecha]).slice(0,10):fechaLect
+          })).filter(r=>r.matricula&&!isNaN(r.km)&&r.km>0);
+        }
+        if(!rows.length){setErrores(["No se encontraron filas válidas con matrícula y km."]);return;}
+        // Cruzar con vehículos
+        const resultado=rows.map(r=>{
+          const v=vehiculos.find(x=>x.matricula.toUpperCase().replace(/[\s-]/g,"")===r.matricula.replace(/[\s-]/g,""));
+          return{...r,vehiculoId:v?.id,codigo:v?.codigo,kmAnterior:v?.km,ok:!!v,diff:v?r.km-v.km:null};
+        });
+        setFilas(resultado);
+        setErrores([]);
+        setPaso("preview");
+      }catch(err){setErrores(["Error leyendo el archivo: "+err.message]);}
+    };
+    if(ext==="csv"||ext==="txt")reader.readAsText(file,"UTF-8");
+    else reader.readAsBinaryString(file);
+  };
+
+  const aplicar=()=>{
+    const validos=filas.filter(f=>f.ok&&f.km>0);
+    setVehiculos(prev=>prev.map(v=>{
+      const r=validos.find(f=>f.vehiculoId===v.id);
+      if(!r)return v;
+      return{...v,km:r.km,histKm:[...(v.histKm||[]),{fecha:r.fecha,km:r.km,anterior:v.km}]};
+    }));
+    setActualizados(validos);
+    setPaso("done");
+  };
+
+  const validos=filas.filter(f=>f.ok);
+  const noEncontrados=filas.filter(f=>!f.ok);
+
+  return h(Modal,{title:"📥 Importar km semanales",onClose,wide:true},
+    paso==="upload"&&h("div",null,
+      h("div",{style:{background:C.bluB,border:`1px solid ${C.bluD}`,borderRadius:8,padding:14,marginBottom:14,fontSize:12,color:C.blu}},
+        h("div",{style:{fontWeight:700,marginBottom:6}},"📋 Formato esperado del archivo"),
+        h("div",null,"El archivo Excel (.xlsx) o CSV debe tener al menos estas columnas (el nombre puede variar):"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginTop:8}},
+          h("div",{style:{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:6,padding:"6px 10px",fontWeight:700,fontSize:12,textAlign:"center"}},"matricula"),
+          h("div",{style:{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:6,padding:"6px 10px",fontWeight:700,fontSize:12,textAlign:"center"}},"km"),
+          h("div",{style:{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:6,padding:"6px 10px",fontSize:12,textAlign:"center",color:C.txtS}},"fecha (opcional)")
+        ),
+        h("div",{style:{marginTop:8,color:C.txtS,fontSize:11}},"Si no incluyes columna de fecha, se usará la fecha que indiques abajo.")
+      ),
+      h("div",{style:{marginBottom:12}},
+        h("label",{style:{fontSize:12,fontWeight:600,display:"block",marginBottom:4}},"Fecha de la lectura (si no viene en el archivo)"),
+        h("input",{type:"date",value:fechaLect,onChange:e=>setFechaLect(e.target.value),style:{padding:"6px 10px",borderRadius:7,border:`1px solid ${C.bdr}`,fontSize:13}})
+      ),
+      h("label",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,padding:28,border:`2px dashed ${C.bdr}`,borderRadius:10,cursor:"pointer",background:C.gryB,textAlign:"center"}},
+        h("span",{style:{fontSize:32}},"📂"),
+        h("span",{style:{fontWeight:600,fontSize:13}},"Seleccionar archivo Excel o CSV"),
+        h("span",{style:{fontSize:11,color:C.txtS}},"Formatos soportados: .xlsx, .xls, .csv"),
+        h("input",{type:"file",accept:".xlsx,.xls,.csv,.txt",onChange:leerArchivo,style:{display:"none"}})
+      ),
+      errores.length>0&&h("div",{style:{marginTop:10,background:C.redB,border:`1px solid ${C.redD}`,borderRadius:7,padding:10,fontSize:12,color:C.red}},
+        errores.map((e,i)=>h("div",{key:i},e))
+      ),
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginTop:14}},
+        h(Btn,{variant:"ghost",onClick:onClose},"Cancelar")
+      )
+    ),
+
+    paso==="preview"&&h("div",null,
+      h("div",{style:{display:"flex",gap:10,marginBottom:12,flexWrap:"wrap"}},
+        h("div",{style:{background:C.grnB,border:`1px solid ${C.grnD}`,borderRadius:7,padding:"8px 14px",fontSize:13}},
+          h("span",{style:{fontWeight:700,color:C.grn}},validos.length)," vehículos encontrados ✔"
+        ),
+        noEncontrados.length>0&&h("div",{style:{background:C.oraB,border:`1px solid ${C.oraD}`,borderRadius:7,padding:"8px 14px",fontSize:13}},
+          h("span",{style:{fontWeight:700,color:C.ora}},noEncontrados.length)," matrículas no encontradas ⚠"
+        )
+      ),
+      h("div",{style:{maxHeight:340,overflowY:"auto",border:`1px solid ${C.bdr}`,borderRadius:8}},
+        h("table",{style:{width:"100%",fontSize:12}},
+          h("thead",null,h("tr",{style:{background:C.nav,position:"sticky",top:0}},
+            ["Matrícula","Código","Fecha","Km anterior","Km nuevo","Diferencia",""].map(t=>h("th",{key:t,style:{padding:"7px 10px",color:"#fff",textAlign:"left",fontWeight:500,fontSize:11}},t))
+          )),
+          h("tbody",null,filas.map((f,i)=>h("tr",{key:i,style:{background:f.ok?i%2?C.gryB:C.card:C.redB}},
+            h("td",{style:{padding:"6px 10px",fontWeight:600}},f.matricula),
+            h("td",{style:{padding:"6px 10px",color:C.acc,fontWeight:700}},f.codigo||"—"),
+            h("td",{style:{padding:"6px 10px",color:C.txtS}},f.fecha),
+            h("td",{style:{padding:"6px 10px",textAlign:"right"}},f.kmAnterior!=null?f.kmAnterior.toLocaleString():"—"),
+            h("td",{style:{padding:"6px 10px",textAlign:"right",fontWeight:600}},f.km.toLocaleString()),
+            h("td",{style:{padding:"6px 10px",textAlign:"right",color:f.diff>0?C.grn:f.diff<0?C.red:C.txtM}},
+              f.diff!=null?(f.diff>0?"+":"")+f.diff.toLocaleString()+" km":"—"
+            ),
+            h("td",{style:{padding:"6px 10px"}},f.ok
+              ?h("span",{style:{color:C.grn,fontSize:11,fontWeight:600}},"✔ OK")
+              :h("span",{style:{color:C.red,fontSize:11,fontWeight:600}},"⚠ No encontrada"))
+          )))
+        )
+      ),
+      noEncontrados.length>0&&h("div",{style:{marginTop:8,fontSize:11,color:C.ora}},
+        "Matrículas no encontradas: ",noEncontrados.map(f=>f.matricula).join(", ")
+      ),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"space-between",marginTop:14}},
+        h(Btn,{variant:"ghost",onClick:()=>setPaso("upload")},"← Volver"),
+        h(Btn,{onClick:aplicar,disabled:validos.length===0},`Actualizar ${validos.length} vehículos`)
+      )
+    ),
+
+    paso==="done"&&h("div",{style:{textAlign:"center",padding:"24px 0"}},
+      h("div",{style:{fontSize:40,marginBottom:12}},"✅"),
+      h("div",{style:{fontSize:16,fontWeight:700,color:C.grn,marginBottom:6}},`${actualizados.length} vehículos actualizados`),
+      h("div",{style:{fontSize:12,color:C.txtS,marginBottom:16}},"Los km han quedado registrados con fecha "+fechaLect),
+      h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"center",maxWidth:500,margin:"0 auto"}},
+        actualizados.map(a=>h("span",{key:a.vehiculoId,style:{background:C.grnB,border:`1px solid ${C.grnD}`,color:C.grn,borderRadius:99,padding:"3px 10px",fontSize:11,fontWeight:600}},a.codigo))
+      ),
+      h("div",{style:{marginTop:20}},h(Btn,{onClick:onClose},"Cerrar"))
+    )
+  );
+}
+
+/* ── Tabla Vehículos ── */
+function ModVehiculos({vehiculos,setVehiculos,onSelect,intervenciones,aceite,neumaticos,sanciones,seguros}){
+  const [filtroE,setFiltroE]=useState("Todos");
+  const [filtroA,setFiltroA]=useState("Todos");
+  const [q,setQ]=useState("");
+  const [modal,setModal]=useState(null);
+  const [form,setForm]=useState({});
+  const [showImport,setShowImport]=useState(false);
+  const ff=k=>v=>setForm(p=>({...p,[k]:v}));
+
+  const lista=useMemo(()=>vehiculos.filter(v=>{
+    if(filtroE!=="Todos"&&v.estado!==filtroE)return false;
+    if(q&&!`${v.codigo} ${v.matricula} ${v.marca} ${v.modelo}`.toLowerCase().includes(q.toLowerCase()))return false;
+    if(filtroA==="ITV"){const d=diasHasta(v.itv);return d!==null&&d<60;}
+    if(filtroA==="Aceite")return v.km>=(v.kmUltAceite+v.intervaloAceite)-1000;
+    if(filtroA==="Seguro"){const d=diasHasta(v.seguroVto);return d!==null&&d<60;}
+    if(filtroA==="Tacógrafo")return v.tacoFechaRenov&&diasHasta(v.tacoFechaRenov)<60;
+    return true;
+  }),[vehiculos,filtroE,q,filtroA]);
+
+  const abrirEditar=v=>{setForm({...v});setModal("edit");};
+  const abrirNuevo=()=>{setForm({id:uid(),codigo:`H-${String(vehiculos.length+1).padStart(2,"0")}`,matricula:"",marca:"",modelo:"",anio:2022,bastidor:"",km:0,estado:"Operativo",itv:"",seguroVto:"",seguroCompania:"",seguroPoliza:"",seguroTipo:"Todo riesgo",tacoMarca:"",tacoModelo:"",tacoCodigo:"",tacoFechaRenov:"",intervaloAceite:20000,tipoAceite:"15W-40",litrosAceite:22,filtrosNota:"",conductorHabitual:"",mecanico:"",kmUltAceite:0,proveedor:"",fechaCompra:"",precio:0,obs:""});setModal("new");};
+  const guardar=()=>{setVehiculos(p=>modal==="new"?[...p,form]:p.map(v=>v.id===form.id?form:v));setModal(null);};
+  const eliminar=id=>{if(confirm("¿Eliminar este vehículo?"))setVehiculos(p=>p.filter(v=>v.id!==id));setModal(null);};
+
+  return h("div",null,
+    h("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:12,flexWrap:"wrap",justifyContent:"space-between"}},
+      h("div",{style:{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}},
+        h("input",{placeholder:"Buscar...",value:q,onChange:e=>setQ(e.target.value),style:{padding:"6px 12px",borderRadius:7,border:`1px solid ${C.bdr}`,fontSize:13,width:180}}),
+        ["Todos",...ESTADOS_VEH].map(e=>h("button",{key:e,onClick:()=>setFiltroE(e),style:{padding:"5px 10px",borderRadius:7,fontSize:11,fontWeight:500,cursor:"pointer",border:`1px solid ${filtroE===e?C.acc:C.bdr}`,background:filtroE===e?C.acc:"transparent",color:filtroE===e?"#fff":C.txtS}},e)),
+        h("button",{onClick:()=>setFiltroA(filtroA==="ITV"?"Todos":"ITV"),style:{padding:"5px 10px",borderRadius:7,fontSize:11,cursor:"pointer",border:`1px solid ${filtroA==="ITV"?C.ora:C.bdr}`,background:filtroA==="ITV"?C.oraB:"transparent",color:filtroA==="ITV"?C.ora:C.txtS}},"⚠ ITV"),
+        h("button",{onClick:()=>setFiltroA(filtroA==="Seguro"?"Todos":"Seguro"),style:{padding:"5px 10px",borderRadius:7,fontSize:11,cursor:"pointer",border:`1px solid ${filtroA==="Seguro"?C.blu:C.bdr}`,background:filtroA==="Seguro"?C.bluB:"transparent",color:filtroA==="Seguro"?C.blu:C.txtS}},"🛡 Seguro"),
+        h("button",{onClick:()=>setFiltroA(filtroA==="Tacógrafo"?"Todos":"Tacógrafo"),style:{padding:"5px 10px",borderRadius:7,fontSize:11,cursor:"pointer",border:`1px solid ${filtroA==="Tacógrafo"?C.pur:C.bdr}`,background:filtroA==="Tacógrafo"?C.purB:"transparent",color:filtroA==="Tacógrafo"?C.pur:C.txtS}},"📟 Tacógrafo"),
+      ),
+      h("div",{style:{display:"flex",gap:6}},
+        h(Btn,{onClick:()=>setShowImport(true),sm:true,variant:"ghost"},"📥 Importar km"),
+        h(Btn,{onClick:abrirNuevo,sm:true},"+ Nuevo vehículo")
+      )
+    ),
+    showImport&&h(ImportarKm,{vehiculos,setVehiculos,onClose:()=>setShowImport(false)}),
+    h("div",{style:{overflowX:"auto"}},
+      h("table",{style:{width:"100%",fontSize:12}},
+        h("thead",null,h("tr",{style:{background:C.nav}},
+          ["Código","Matrícula","Marca / Modelo","Año","Km","Estado","ITV","Aceite","Seguro","Tacógrafo","Coste total",""].map(th=>h("th",{key:th,style:{padding:"8px 10px",textAlign:"left",color:C.navText,fontWeight:500,fontSize:11,whiteSpace:"nowrap"}},th))
+        )),
+        h("tbody",null,lista.map((v,i)=>{
+          const itv=alertaITV(v.itv),ac=alertaAce(v.km,v.kmUltAceite,v.intervaloAceite);
+          const seg=alertaSeguro(v.seguroVto),taco=alertaTaco(v.tacoFechaRenov);
+          const ec=EC[v.estado]||EC["Operativo"];
+          const myOTs=(intervenciones||[]).filter(x=>x.vehiculoId===v.id);
+          const myAce=(aceite||[]).filter(x=>x.vehiculoId===v.id);
+          const myNeu=(neumaticos||[]).filter(x=>x.vehiculoId===v.id);
+          const mySan=(sanciones||[]).filter(x=>x.vehiculoId===v.id);
+          const mySeg=(seguros||[]).filter(x=>x.vehiculoId===v.id&&!x.esSiniestro);
+          const costeTotal=myOTs.reduce((s,o)=>s+(+o.costeOT||0)+(+o.costeRec||0),0)+myAce.reduce((s,a)=>s+(+a.coste||0),0)+myNeu.reduce((s,n)=>s+(+n.coste||0),0)+mySeg.reduce((s,p)=>s+(+p.prima||0),0)+mySan.reduce((s,sa)=>s+(+sa.importe||0),0);
+          return h("tr",{key:v.id,style:{background:i%2?C.gryB:C.card,cursor:"pointer"},onClick:()=>onSelect(v)},
+            h("td",{style:{padding:"8px 10px",fontWeight:700,color:C.acc}},v.codigo),
+            h("td",{style:{padding:"8px 10px"}},v.matricula),
+            h("td",{style:{padding:"8px 10px",color:C.txtS}},v.marca," ",v.modelo),
+            h("td",{style:{padding:"8px 10px",color:C.txtS}},v.anio),
+            h("td",{style:{padding:"8px 10px",textAlign:"right"}},(+v.km).toLocaleString()),
+            h("td",{style:{padding:"8px 10px"}},h("span",{style:{background:ec.bg,border:`1px solid ${ec.bdr}`,color:ec.txt,borderRadius:99,padding:"2px 7px",fontSize:11,fontWeight:600}},v.estado)),
+            h("td",{style:{padding:"8px 10px"}},h(Badge,{label:itv.t,scheme:itv.c})),
+            h("td",{style:{padding:"8px 10px"}},h(Badge,{label:ac.t,scheme:ac.c})),
+            h("td",{style:{padding:"8px 10px"}},h(Badge,{label:seg.t,scheme:seg.c})),
+            h("td",{style:{padding:"8px 10px"}},v.tacoFechaRenov?h(Badge,{label:taco.t,scheme:taco.c}):h("span",{style:{color:C.txtM,fontSize:11}},"—")),
+            h("td",{style:{padding:"8px 10px",textAlign:"right",fontWeight:600,color:costeTotal>0?C.ora:C.txtM}},costeTotal>0?costeTotal.toLocaleString("es-ES",{minimumFractionDigits:0})+" €":"—"),
+            h("td",{style:{padding:"8px 10px"},onClick:e=>{e.stopPropagation();abrirEditar(v);}},h(Btn,{sm:true,variant:"ghost"},"Editar"))
+          );
+        }))
+      )
+    ),
+    h("div",{style:{marginTop:6,fontSize:11,color:C.txtM}},lista.length," de ",vehiculos.length," vehículos"),
+
+    (modal==="edit"||modal==="new")&&h(Modal,{title:modal==="new"?"Nuevo vehículo":`Editar ${form.codigo}`,onClose:()=>setModal(null),wide:true},
+      h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,marginBottom:8,paddingBottom:4,borderBottom:`1px solid ${C.bdr}`}},"Datos generales"),
+      h(Grid2,null,
+        h(Inp,{label:"Código interno",value:form.codigo,onChange:ff("codigo"),req:true}),
+        h(Inp,{label:"Matrícula",value:form.matricula,onChange:ff("matricula"),req:true}),
+        h(Inp,{label:"Marca",value:form.marca,onChange:ff("marca"),opts:MARCAS}),
+        h(Inp,{label:"Modelo",value:form.modelo,onChange:ff("modelo")}),
+        h(Inp,{label:"Año fabricación",value:form.anio,onChange:ff("anio"),type:"number"}),
+        h(Inp,{label:"Nº bastidor (VIN)",value:form.bastidor,onChange:ff("bastidor")}),
+        h(Inp,{label:"Km actuales",value:form.km,onChange:ff("km"),type:"number",req:true}),
+        h(Inp,{label:"Estado",value:form.estado,onChange:ff("estado"),opts:ESTADOS_VEH}),
+        h(Inp,{label:"Próxima ITV",value:form.itv,onChange:ff("itv"),type:"date"}),
+        h(Inp,{label:"Conductor habitual",value:form.conductorHabitual,onChange:ff("conductorHabitual")}),
+        h(Inp,{label:"Proveedor / Dealer",value:form.proveedor,onChange:ff("proveedor")}),
+        h(Inp,{label:"Fecha compra",value:form.fechaCompra,onChange:ff("fechaCompra"),type:"date"}),
+        h(Inp,{label:"Precio compra (€)",value:form.precio,onChange:ff("precio"),type:"number"}),
+      ),
+      h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px",paddingBottom:4,borderBottom:`1px solid ${C.bdr}`}},"Seguro"),
+      h(Grid2,null,
+        h(Inp,{label:"Vencimiento seguro",value:form.seguroVto,onChange:ff("seguroVto"),type:"date"}),
+        h(Inp,{label:"Compañía aseguradora",value:form.seguroCompania,onChange:ff("seguroCompania")}),
+        h(Inp,{label:"Nº póliza",value:form.seguroPoliza,onChange:ff("seguroPoliza")}),
+        h(Inp,{label:"Tipo seguro",value:form.seguroTipo,onChange:ff("seguroTipo"),opts:["Todo riesgo","Todo riesgo con franquicia","Terceros ampliado","Terceros básico"]}),
+      ),
+      h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px",paddingBottom:4,borderBottom:`1px solid ${C.bdr}`}},"Tacógrafo"),
+      h(Grid2,null,
+        h(Inp,{label:"Marca tacógrafo",value:form.tacoMarca,onChange:ff("tacoMarca")}),
+        h(Inp,{label:"Modelo tacógrafo",value:form.tacoModelo,onChange:ff("tacoModelo")}),
+        h(Inp,{label:"Código / Nº serie",value:form.tacoCodigo,onChange:ff("tacoCodigo")}),
+        h(Inp,{label:"Fecha renovación/caducidad",value:form.tacoFechaRenov,onChange:ff("tacoFechaRenov"),type:"date"}),
+      ),
+      h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px",paddingBottom:4,borderBottom:`1px solid ${C.bdr}`}},"Aceite"),
+      h(Grid2,null,
+        h(Inp,{label:"Intervalo aceite (km)",value:form.intervaloAceite,onChange:ff("intervaloAceite"),type:"number"}),
+        h(Inp,{label:"Tipo/viscosidad aceite",value:form.tipoAceite,onChange:ff("tipoAceite"),opts:["5W-30","10W-40","15W-40","5W-40","Otra"]}),
+        h(Inp,{label:"Litros aceite",value:form.litrosAceite,onChange:ff("litrosAceite"),type:"number"}),
+      ),
+      h(Inp,{label:"Tipos de filtros necesarios (descripción libre)",value:form.filtrosNota,onChange:ff("filtrosNota"),rows:2,placeholder:"Ej: Filtro aceite Mann W920/21, filtro aire Donaldson P772531, filtro gasoil WK940/33..."}),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:2}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"space-between",marginTop:8}},
+        modal==="edit"?h(Btn,{variant:"danger",sm:true,onClick:()=>eliminar(form.id)},"Eliminar"):h("div"),
+        h("div",{style:{display:"flex",gap:8}},
+          h(Btn,{variant:"ghost",onClick:()=>setModal(null)},"Cancelar"),
+          h(Btn,{onClick:guardar},"Guardar")
+        )
+      )
+    )
+  );
+}
+
+/* ── Exportar Word ── */
+async function exportarInformeWord(v,{myOTs,myAce,myNeu,mySan,myExt,mySeg,siniestros,polizas}){
+  // Asegurar que la librería docx está disponible
+  if(typeof docx==="undefined"){
+    await new Promise((res,rej)=>{
+      const s=document.createElement("script");
+      s.src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js";
+      s.onload=res;s.onerror=rej;document.head.appendChild(s);
+    });
+  }
+  const {Document,Packer,Paragraph,Table,TableRow,TableCell,TextRun,HeadingLevel,WidthType,AlignmentType,BorderStyle,ShadingType}=docx;
+  const fmtDate=s=>s?new Date(s).toLocaleDateString("es-ES"):"—";
+  const fmtNum=n=>n!=null&&n!==""?Number(n).toLocaleString("es-ES"):"—";
+  const fmtEur=n=>n!=null&&n!==""?Number(n).toLocaleString("es-ES",{minimumFractionDigits:2})+" €":"—";
+
+  const hdr=(txt,lvl=HeadingLevel.HEADING_1)=>new Paragraph({text:txt,heading:lvl,spacing:{before:240,after:120}});
+  const sep=()=>new Paragraph({text:"",spacing:{before:60,after:60}});
+  const pr=(label,val)=>new Paragraph({children:[new TextRun({text:label+": ",bold:true,size:20}),new TextRun({text:String(val||"—"),size:20})],spacing:{before:40,after:40}});
+
+  const tblBorder={style:BorderStyle.SINGLE,size:4,color:"CCCCCC"};
+  const cellBorders={top:tblBorder,bottom:tblBorder,left:tblBorder,right:tblBorder};
+
+  const mkCell=(txt,isHead=false)=>new TableCell({
+    children:[new Paragraph({children:[new TextRun({text:String(txt||"—"),bold:isHead,size:isHead?18:18,color:isHead?"FFFFFF":"333333"})],alignment:AlignmentType.LEFT,spacing:{before:40,after:40}})],
+    borders:cellBorders,
+    shading:isHead?{type:ShadingType.SOLID,color:"0D2B5A",fill:"0D2B5A"}:{type:ShadingType.CLEAR,color:"auto",fill:"auto"},
+    margins:{top:60,bottom:60,left:100,right:100}
+  });
+
+  const mkTable=(headers,rows)=>{
+    if(!rows.length)return new Paragraph({children:[new TextRun({text:"Sin registros",italics:true,color:"999999",size:20})],spacing:{before:40,after:80}});
+    const colW=Math.floor(9000/headers.length);
+    return new Table({
+      width:{size:100,type:WidthType.PERCENTAGE},
+      rows:[
+        new TableRow({children:headers.map(h=>mkCell(h,true)),tableHeader:true}),
+        ...rows.map(r=>new TableRow({children:r.map(c=>mkCell(c))}))
+      ],
+      margins:{top:0,bottom:0,left:0,right:0}
+    });
+  };
+
+  const costeOTs=myOTs.reduce((s,o)=>s+(+o.costeOT||0)+(+o.costeRec||0),0);
+  const costeAce=myAce.reduce((s,a)=>s+(+a.coste||0),0);
+  const costeNeu=myNeu.reduce((s,n)=>s+(+n.coste||0),0);
+  const costeSeg=polizas.reduce((s,p)=>s+(+p.prima||0),0);
+  const costeSan=mySan.reduce((s,s2)=>s+(+s2.importe||0),0);
+  const costeTotal=costeOTs+costeAce+costeNeu+costeSeg+costeSan;
+
+  const children=[
+    // PORTADA
+    new Paragraph({children:[new TextRun({text:"INFORME DE VEHÍCULO",bold:true,size:48,color:"0D2B5A"})],alignment:AlignmentType.CENTER,spacing:{before:400,after:120}}),
+    new Paragraph({children:[new TextRun({text:`${v.codigo} — ${v.matricula}`,bold:true,size:36,color:"1B5CB5"})],alignment:AlignmentType.CENTER,spacing:{before:0,after:80}}),
+    new Paragraph({children:[new TextRun({text:`${v.marca} ${v.modelo} · Año ${v.anio}`,size:24,color:"666666"})],alignment:AlignmentType.CENTER,spacing:{before:0,after:80}}),
+    new Paragraph({children:[new TextRun({text:`Generado el ${new Date().toLocaleDateString("es-ES",{day:"2-digit",month:"long",year:"numeric"})}`,size:20,color:"999999"})],alignment:AlignmentType.CENTER,spacing:{before:0,after:400}}),
+
+    // 1. DATOS GENERALES
+    hdr("1. Datos generales",HeadingLevel.HEADING_1),
+    mkTable(["Campo","Valor"],[
+      ["Código interno",v.codigo],["Matrícula",v.matricula],["Marca",v.marca],["Modelo",v.modelo],
+      ["Año fabricación",v.anio],["Bastidor (VIN)",v.bastidor||"—"],["Estado",v.estado],
+      ["Km actuales",fmtNum(v.km)+" km"],["Conductor habitual",v.conductorHabitual||"—"],
+      ["Proveedor / Dealer",v.proveedor||"—"],["Fecha compra",fmtDate(v.fechaCompra)],
+      ["Precio compra",fmtEur(v.precio)],["Observaciones",v.obs||"—"],
+    ]),
+    sep(),
+
+    // 2. ACEITE Y FILTROS
+    hdr("2. Aceite y filtros",HeadingLevel.HEADING_1),
+    mkTable(["Campo","Valor"],[
+      ["Tipo aceite",v.tipoAceite],["Litros",v.litrosAceite+" L"],["Intervalo",fmtNum(v.intervaloAceite)+" km"],
+      ["Km último cambio",fmtNum(v.kmUltAceite)+" km"],["Tipos de filtros",v.filtrosNota||"—"],
+    ]),
+    sep(),
+
+    // 3. ITV
+    hdr("3. ITV",HeadingLevel.HEADING_1),
+    mkTable(["Campo","Valor"],[
+      ["Próxima ITV",fmtDate(v.itv)],
+    ]),
+    sep(),
+
+    // 4. SEGURO (datos del vehículo)
+    hdr("4. Seguro",HeadingLevel.HEADING_1),
+    mkTable(["Campo","Valor"],[
+      ["Vencimiento",fmtDate(v.seguroVto)],["Compañía",v.seguroCompania||"—"],
+      ["Nº póliza",v.seguroPoliza||"—"],["Tipo",v.seguroTipo||"—"],
+    ]),
+    sep(),
+
+    // 5. TACÓGRAFO
+    hdr("5. Tacógrafo",HeadingLevel.HEADING_1),
+    mkTable(["Campo","Valor"],[
+      ["Marca",v.tacoMarca||"—"],["Modelo",v.tacoModelo||"—"],
+      ["Código / Nº serie",v.tacoCodigo||"—"],["Fecha renovación",fmtDate(v.tacoFechaRenov)],
+    ]),
+    sep(),
+
+    // 6. RESUMEN COSTES
+    hdr("6. Resumen de costes",HeadingLevel.HEADING_1),
+    mkTable(["Concepto","Importe"],[
+      ["Órdenes de trabajo (mano de obra + recambios)",fmtEur(costeOTs)],
+      ["Cambios de aceite",fmtEur(costeAce)],
+      ["Neumáticos",fmtEur(costeNeu)],
+      ["Primas de seguro",fmtEur(costeSeg)],
+      ["Sanciones",fmtEur(costeSan)],
+      ["TOTAL",fmtEur(costeTotal)],
+    ]),
+    sep(),
+
+    // 7. ÓRDENES DE TRABAJO
+    hdr("7. Órdenes de trabajo ("+myOTs.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha","Tipo","Estado","Nivel","Síntoma / Trabajos","Km","Coste OT","Coste rec.","Proveedor"],
+      myOTs.map(o=>[fmtDate(o.fecha),o.tipo,o.estadoOT,o.nivel||"—",o.sintoma||(o.trabajos||"—"),fmtNum(o.km)+" km",fmtEur(o.costeOT),fmtEur(o.costeRec),o.tallerExterno?(o.proveedorTaller||"Externo"):"Taller propio"])
+    ),
+    sep(),
+
+    // 8. CAMBIOS DE ACEITE
+    hdr("8. Cambios de aceite ("+myAce.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha","Km","Marca aceite","Viscosidad","Litros","Filtros cambiados","Coste"],
+      myAce.map(a=>[fmtDate(a.fecha),fmtNum(a.km)+" km",a.marcaAceite||"—",a.visc||"—",a.litros+" L",[a.fAceite?"Aceite":null,a.fAire?"Aire":null,a.fGasoil?"Gasoil":null,a.fAdblue?"AdBlue":null].filter(Boolean).join(", ")||"Solo aceite",fmtEur(a.coste)])
+    ),
+    sep(),
+
+    // 9. NEUMÁTICOS
+    hdr("9. Neumáticos ("+myNeu.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha","Posición","Marca","Medida","Motivo","Prof. salida","Prof. nuevo","Presión","Coste"],
+      myNeu.map(n=>[fmtDate(n.fecha),n.posicion||"—",n.marca||"—",n.medida||"—",n.motivo||"—",(n.profSal||"—")+" mm",(n.profNvo||"—")+" mm",(n.presion||"—")+" bar",fmtEur(n.coste)])
+    ),
+    sep(),
+
+    // 10. SANCIONES
+    hdr("10. Sanciones ("+mySan.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha","Tipo infracción","Gravedad","Conductor","Organismo","Importe","Puntos","Estado"],
+      mySan.map(s=>[fmtDate(s.fechaInf),s.tipo||"—",s.gravedad||"—",s.conductor||"—",s.organismo||"—",fmtEur(s.importe),s.puntos||"0",s.estado])
+    ),
+    sep(),
+
+    // 11. EXTINTORES Y ELEMENTOS DE SEGURIDAD
+    hdr("11. Extintores y elementos de seguridad ("+myExt.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Tipo","Posición","Estado","Agente","Capacidad","Fabricación","Última rev.","Próxima rev.","Precinto"],
+      myExt.map(e=>[e.tipoElem,e.posicion||"—",e.estado,e.tipoAgente||"—",(e.capacidad||"—")+" kg",fmtDate(e.fabricacion),fmtDate(e.ultimaRev),fmtDate(e.proximaRev),e.precinto?"Sí":"No"])
+    ),
+    sep(),
+
+    // 12. PÓLIZAS DE SEGURO
+    hdr("12. Pólizas de seguro ("+polizas.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha alta","Vencimiento","Compañía","Nº póliza","Tipo","Prima anual","Observaciones"],
+      polizas.map(p=>[fmtDate(p.fecha),fmtDate(p.vencimiento),p.compania||"—",p.poliza||"—",p.tipo||"—",fmtEur(p.prima),p.obs||"—"])
+    ),
+    sep(),
+
+    // 13. SINIESTROS
+    hdr("13. Siniestros declarados ("+siniestros.length+")",HeadingLevel.HEADING_1),
+    mkTable(
+      ["Fecha","Tipo","Conductor","Responsabilidad","Estado expediente","Importe rep.","Descripción"],
+      siniestros.map(s=>[fmtDate(s.fecha),s.tipo||"—",s.conductor||"—",s.culpa||"—",s.estado||"—",fmtEur(s.importeRep),s.descripcion||"—"])
+    ),
+    sep(),
+
+    // 14. HISTORIAL KM
+    ...(v.histKm&&v.histKm.length>0?[
+      hdr("14. Historial de km importados ("+v.histKm.length+")",HeadingLevel.HEADING_1),
+      mkTable(
+        ["Fecha","Km registrados","Km anteriores","Diferencia"],
+        [...v.histKm].reverse().map(r=>[fmtDate(r.fecha),fmtNum(r.km)+" km",fmtNum(r.anterior)+" km","+"+(r.km-r.anterior).toLocaleString("es-ES")+" km"])
+      ),
+      sep(),
+    ]:[]),
+
+    // PIE
+    new Paragraph({children:[new TextRun({text:`Documento generado automáticamente por FlotaHorm. · ${new Date().toLocaleString("es-ES")}`,size:16,color:"AAAAAA",italics:true})],alignment:AlignmentType.CENTER,spacing:{before:400}}),
+  ];
+
+  const doc=new Document({sections:[{properties:{},children}]});
+  const fname=`Informe_${v.codigo}_${v.matricula.replace(/[^A-Z0-9]/g,"")}_${hoy()}.docx`;
+
+  // 1) Intentar API nativa de descargas del artifact viewer
+  try{
+    const dl=window.claude&&await window.claude.use("downloads");
+    if(dl){
+      const blob=await Packer.toBlob(doc);
+      const ab=await blob.arrayBuffer();
+      await dl.save(fname,new Uint8Array(ab),"application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      return;
+    }
+  }catch(e){console.warn("downloads API error:",e);}
+
+  // 2) Fallback: convertir a base64 y abrir nueva ventana con enlace de descarga
+  try{
+    const b64=await Packer.toBase64String(doc);
+    const dataUrl="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"+b64;
+    const win=window.open("","_blank");
+    if(win){
+      win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Descarga</title></head><body style="font-family:sans-serif;padding:40px;text-align:center"><h2>📄 ${fname}</h2><p style="margin:20px 0">Haz clic en el botón para descargar el informe Word</p><a href="${dataUrl}" download="${fname}" style="display:inline-block;background:#E87722;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">⬇ Descargar ${fname}</a></body></html>`);
+      win.document.close();
+      return;
+    }
+  }catch(e){console.warn("base64 fallback error:",e);}
+
+  // 3) Último recurso: blob URL directo
+  try{
+    const blob=await Packer.toBlob(doc);
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;a.download=fname;document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),5000);
+  }catch(e){alert("No se pudo generar el informe. Error: "+e.message);}
+}
+
+/* ── Ficha Vehículo ── */
+function FichaVehiculo({v,vFull,mecanicos,intervenciones,aceite,neumaticos,sanciones,extintores,seguros,setSeguros,onBack,setVehiculos,setIntervenciones,setAceite,setNeumaticos,setSanciones,setExtintores}){
+  const [tab,setTab]=useState("info");
+  const [modal,setModal]=useState(null);
+  const [form,setForm]=useState({});
+  const [editId,setEditId]=useState(null); // id del registro en edición (null = nuevo)
+  const [editInfo,setEditInfo]=useState(false);
+  const [infoForm,setInfoForm]=useState({...v});
+  const ff=k=>val=>setForm(p=>({...p,[k]:val}));
+  const fi=k=>val=>setInfoForm(p=>({...p,[k]:val}));
+
+  // datos del vehículo (puede estar editado localmente)
+  const vd=editInfo?infoForm:v;
+
+  const myOTs=intervenciones.filter(x=>x.vehiculoId===v.id).sort((a,b)=>new Date(b.fecha)-new Date(a.fecha));
+  const myAce=aceite.filter(x=>x.vehiculoId===v.id).sort((a,b)=>b.km-a.km);
+  const myNeu=neumaticos.filter(x=>x.vehiculoId===v.id).sort((a,b)=>new Date(b.fecha)-new Date(a.fecha));
+  const mySan=sanciones.filter(x=>x.vehiculoId===v.id).sort((a,b)=>new Date(b.fechaInf)-new Date(a.fechaInf));
+  const myExt=extintores.filter(x=>x.vehiculoId===v.id);
+  const mySeg=seguros.filter(x=>x.vehiculoId===v.id).sort((a,b)=>new Date(b.fecha)-new Date(a.fecha));
+
+  const mec=mecanicos.find(m=>m.id===v.mecanico);
+  const itv=alertaITV(v.itv);
+  const ac=alertaAce(v.km,v.kmUltAceite,v.intervaloAceite);
+  const seg=alertaSeguro(v.seguroVto);
+  const taco=alertaTaco(v.tacoFechaRenov);
+  const ec=EC[v.estado]||EC["Operativo"];
+
+  // Coste total vehículo
+  const costeOTs=myOTs.reduce((s,o)=>s+(+o.costeOT||0)+(+o.costeRec||0),0);
+  const costeAce=myAce.reduce((s,a)=>s+(+a.coste||0),0);
+  const costeNeu=myNeu.reduce((s,n)=>s+(+n.coste||0),0);
+  const costeSeg=mySeg.reduce((s,sg)=>s+(+sg.prima||0),0);
+  const costeSan=mySan.reduce((s,sa)=>s+(+sa.importe||0),0);
+  const costeTotal=costeOTs+costeAce+costeNeu+costeSeg+costeSan;
+
+  const defOT={tipo:"Reparación taller propio",estadoOT:"Abierta",fecha:hoy(),km:v.km,nivel:"",sintoma:"",diagnostico:"",trabajos:"",recambios:"",horas:"",costeOT:"",costeRec:"",tallerExterno:false,proveedorTaller:"",obs:""};
+  const defAce={fecha:hoy(),km:v.km,marcaAceite:"Castrol",visc:v.tipoAceite,litros:v.litrosAceite,fAceite:false,fAire:false,fGasoil:false,fAdblue:false,litrosAdblue:0,intervalo:v.intervaloAceite,coste:"",obs:""};
+  const defNeu={fecha:hoy(),km:v.km,posicion:"",marca:"",medida:"",tipo:"Nuevo",profSal:"",motivo:"",profNvo:16,presion:8.5,coste:"",obs:""};
+  const defSan={fechaInf:hoy(),conductor:v.conductorHabitual,tipo:"",gravedad:"",lugar:"",organismo:"DGT",expediente:"",importe:"",puntos:"",estado:"Pendiente",fechaLimite:"",obs:""};
+  const defExt={tipoElem:"Extintor cabina",posicion:"Cabina conductor",serie:"",tipoAgente:"Polvo ABC",capacidad:2,fabricacion:"",ultimaRev:"",proximaRev:"",estado:"Vigente",precinto:false,obs:""};
+  const defSeg={fecha:hoy(),compania:v.seguroCompania||"",poliza:v.seguroPoliza||"",tipo:v.seguroTipo||"Todo riesgo",vencimiento:v.seguroVto||"",prima:"",obs:""};
+  const defSin={fecha:hoy(),tipo:"",conductor:"",descripcion:"",danos:"",culpa:"Propia",estado:"Abierto",importeRep:"",obs:""};
+
+  const openM=(tipo,def,id=null)=>{setForm(def);setEditId(id);setModal(tipo);};
+  const upsert=(setter,newData,flag)=>setter(p=>editId?p.map(x=>x.id===editId?{...x,...newData}:x):[...p,{...newData,id:uid(),vehiculoId:v.id,...(flag||{})}]);
+  const saveOT=()=>{upsert(setIntervenciones,form);setModal(null);setEditId(null);};
+  const saveAce=()=>{upsert(setAceite,form);setModal(null);setEditId(null);};
+  const saveNeu=()=>{upsert(setNeumaticos,form);setModal(null);setEditId(null);};
+  const saveSan=()=>{upsert(setSanciones,form);setModal(null);setEditId(null);};
+  const saveExt=()=>{upsert(setExtintores,form);setModal(null);setEditId(null);};
+  const saveSeg=()=>{upsert(setSeguros,form);setModal(null);setEditId(null);};
+  const saveSin=()=>{upsert(setSeguros,{...defSin,...form},{esSiniestro:true});setModal(null);setEditId(null);};
+
+  const delOT=id=>{if(confirm("¿Eliminar?"))setIntervenciones(p=>p.filter(x=>x.id!==id));};
+  const delAce=id=>{if(confirm("¿Eliminar?"))setAceite(p=>p.filter(x=>x.id!==id));};
+  const delNeu=id=>{if(confirm("¿Eliminar?"))setNeumaticos(p=>p.filter(x=>x.id!==id));};
+  const delSan=id=>{if(confirm("¿Eliminar?"))setSanciones(p=>p.filter(x=>x.id!==id));};
+  const delExt=id=>{if(confirm("¿Eliminar?"))setExtintores(p=>p.filter(x=>x.id!==id));};
+  const delSeg=id=>{if(confirm("¿Eliminar?"))setSeguros(p=>p.filter(x=>x.id!==id));};
+
+  const guardarInfo=()=>{
+    setVehiculos(p=>p.map(x=>x.id===v.id?{...x,...infoForm}:x));
+    setEditInfo(false);
+  };
+
+  const siniestros=mySeg.filter(s=>s.esSiniestro);
+  const polizas=mySeg.filter(s=>!s.esSiniestro);
+
+  const [exporting,setExporting]=useState(false);
+  const exportar=async()=>{
+    setExporting(true);
+    try{await exportarInformeWord(v,{myOTs,myAce,myNeu,mySan,myExt,mySeg,siniestros,polizas});}
+    catch(e){alert("Error generando el informe: "+e.message);}
+    setExporting(false);
+  };
+
+  return h("div",null,
+    h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+      h("button",{onClick:onBack,style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:13,padding:0,display:"flex",alignItems:"center",gap:4}},"← Volver a la flota"),
+      h(Btn,{onClick:exportar,disabled:exporting,sm:true},exporting?"⏳ Generando...":"📄 Exportar informe Word")
+    ),
+
+    h("div",{style:{background:C.nav,borderRadius:12,padding:"16px 20px",marginBottom:12,color:"#fff",display:"flex",gap:16,flexWrap:"wrap",alignItems:"flex-start"}},
+      h("div",{style:{flex:1,minWidth:180}},
+        h("div",{style:{fontSize:26,fontWeight:800,letterSpacing:-1}},v.codigo),
+        h("div",{style:{fontSize:15,opacity:.85,marginTop:1}},v.matricula," · ",v.marca," ",v.modelo),
+        h("div",{style:{fontSize:12,opacity:.55,marginTop:3}},v.anio,mec?" · "+mec.nombre:"")
+      ),
+      h("span",{style:{background:ec.bg,color:ec.txt,border:`1px solid ${ec.bdr}`,borderRadius:99,padding:"4px 14px",fontSize:13,fontWeight:700}},v.estado)
+    ),
+
+    h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(105px,1fr))",gap:8,marginBottom:12}},
+      h(Stat,{label:"Km actuales",value:v.km.toLocaleString(),scheme:"blue"}),
+      h(Stat,{label:"ITV",value:itv.t,scheme:itv.c}),
+      h(Stat,{label:"Aceite",value:ac.t,scheme:ac.c}),
+      h(Stat,{label:"Seguro",value:seg.t,scheme:seg.c}),
+      h(Stat,{label:"Tacógrafo",value:v.tacoFechaRenov?taco.t:"—",scheme:v.tacoFechaRenov?taco.c:"gray"}),
+      h(Stat,{label:"OTs totales",value:myOTs.length,scheme:"gray"}),
+      h(Stat,{label:"Coste total",value:`${costeTotal.toLocaleString()}€`,scheme:"orange",sub:"OTs+aceite+neum+seg+san"}),
+    ),
+
+    h(Tabs,{active:tab,onChange:setTab,tabs:[
+      {id:"info",label:"Información"},
+      {id:"ot",label:`OT (${myOTs.length})`},
+      {id:"ace",label:`Aceite (${myAce.length})`},
+      {id:"neu",label:`Neumáticos (${myNeu.length})`},
+      {id:"san",label:`Sanciones (${mySan.length})`},
+      {id:"ext",label:`Extintores (${myExt.length})`},
+      {id:"seg",label:`Seguro (${polizas.length})`},
+      {id:"taco",label:"Tacógrafo"},
+    ]}),
+
+    /* TAB INFO */
+    tab==="info"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},
+        editInfo?h("div",{style:{display:"flex",gap:6}},
+          h(Btn,{variant:"ghost",sm:true,onClick:()=>setEditInfo(false)},"Cancelar"),
+          h(Btn,{sm:true,onClick:guardarInfo},"Guardar cambios")
+        ):h(Btn,{variant:"ghost",sm:true,onClick:()=>{setInfoForm({...v});setEditInfo(true);}},"✏ Editar información")
+      ),
+      !editInfo?h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:8}},
+        [
+          ["Código interno",v.codigo],["Matrícula",v.matricula],["Marca",v.marca],["Modelo",v.modelo],
+          ["Año",v.anio],["Bastidor (VIN)",v.bastidor],["Km actuales",`${v.km.toLocaleString()} km`],
+          ["Estado",v.estado],["Próxima ITV",v.itv||"—"],["Conductor habitual",v.conductorHabitual||"—"],
+          ["Tipo aceite",v.tipoAceite],["Litros aceite",`${v.litrosAceite} L`],
+          ["Intervalo aceite",`${(v.intervaloAceite||20000).toLocaleString()} km`],
+          ["Seguro vencimiento",v.seguroVto||"—"],["Compañía seguro",v.seguroCompania||"—"],["Nº póliza",v.seguroPoliza||"—"],
+          ["Tacógrafo marca",v.tacoMarca||"—"],["Tacógrafo modelo",v.tacoModelo||"—"],
+          ["Tacógrafo código",v.tacoCodigo||"—"],["Tacógrafo caducidad",v.tacoFechaRenov||"—"],
+          ["Proveedor",v.proveedor||"—"],["Fecha compra",v.fechaCompra||"—"],
+          ["Precio compra",v.precio?`${Number(v.precio).toLocaleString()} €`:"—"],
+        ].map(([k,val])=>h("div",{key:k,style:{display:"flex",gap:8,padding:"7px 11px",background:C.gryB,borderRadius:7,border:`1px solid ${C.bdr}`}},
+          h("span",{style:{fontSize:11,color:C.txtS,minWidth:140,flexShrink:0}},k),
+          h("span",{style:{fontSize:12,fontWeight:500,color:C.txt}},String(val))
+        )),
+        v.filtrosNota&&h("div",{style:{gridColumn:"1/-1",padding:"10px 12px",background:C.yelB,border:`1px solid ${C.yelD}`,borderRadius:7}},
+          h("div",{style:{fontSize:11,fontWeight:600,color:C.yel,marginBottom:4}},"📋 TIPOS DE FILTROS"),
+          h("div",{style:{fontSize:12,color:C.txt,whiteSpace:"pre-line"}},v.filtrosNota)
+        ),
+        (v.histKm&&v.histKm.length>0)&&h("div",{style:{gridColumn:"1/-1",marginTop:4}},
+          h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,marginBottom:6}},"📈 Historial de km importados"),
+          h("div",{style:{display:"flex",flexDirection:"column",gap:3}},
+            [...v.histKm].reverse().slice(0,10).map((r,i)=>h("div",{key:i,style:{display:"flex",gap:12,padding:"5px 10px",background:C.gryB,border:`1px solid ${C.bdr}`,borderRadius:6,fontSize:12}},
+              h("span",{style:{color:C.txtS,minWidth:90}},r.fecha),
+              h("span",{style:{fontWeight:700,color:C.txt}},r.km.toLocaleString()," km"),
+              r.anterior!=null&&h("span",{style:{color:C.grn,fontSize:11}},`+${(r.km-r.anterior).toLocaleString()} km`)
+            ))
+          )
+        )
+      ):
+      // modo edición info
+      h("div",null,
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,marginBottom:8}},"Datos generales"),
+        h(Grid2,null,
+          h(Inp,{label:"Matrícula",value:infoForm.matricula,onChange:fi("matricula")}),
+          h(Inp,{label:"Marca",value:infoForm.marca,onChange:fi("marca"),opts:MARCAS}),
+          h(Inp,{label:"Modelo",value:infoForm.modelo,onChange:fi("modelo")}),
+          h(Inp,{label:"Año",value:infoForm.anio,onChange:fi("anio"),type:"number"}),
+          h(Inp,{label:"Bastidor (VIN)",value:infoForm.bastidor,onChange:fi("bastidor")}),
+          h(Inp,{label:"Km actuales",value:infoForm.km,onChange:fi("km"),type:"number"}),
+          h(Inp,{label:"Estado",value:infoForm.estado,onChange:fi("estado"),opts:ESTADOS_VEH}),
+          h(Inp,{label:"Próxima ITV",value:infoForm.itv,onChange:fi("itv"),type:"date"}),
+          h(Inp,{label:"Conductor habitual",value:infoForm.conductorHabitual,onChange:fi("conductorHabitual")}),
+          h(Inp,{label:"Proveedor",value:infoForm.proveedor,onChange:fi("proveedor")}),
+          h(Inp,{label:"Fecha compra",value:infoForm.fechaCompra,onChange:fi("fechaCompra"),type:"date"}),
+          h(Inp,{label:"Precio compra (€)",value:infoForm.precio,onChange:fi("precio"),type:"number"}),
+        ),
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px"}},"Aceite y filtros"),
+        h(Grid2,null,
+          h(Inp,{label:"Tipo aceite",value:infoForm.tipoAceite,onChange:fi("tipoAceite"),opts:["5W-30","10W-40","15W-40","5W-40","Otra"]}),
+          h(Inp,{label:"Litros aceite",value:infoForm.litrosAceite,onChange:fi("litrosAceite"),type:"number"}),
+          h(Inp,{label:"Intervalo aceite (km)",value:infoForm.intervaloAceite,onChange:fi("intervaloAceite"),type:"number"}),
+        ),
+        h(Inp,{label:"Tipos de filtros necesarios",value:infoForm.filtrosNota,onChange:fi("filtrosNota"),rows:3,placeholder:"Ej: Filtro aceite Mann W920/21, filtro aire Donaldson P772531..."}),
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px"}},"Seguro"),
+        h(Grid2,null,
+          h(Inp,{label:"Vencimiento",value:infoForm.seguroVto,onChange:fi("seguroVto"),type:"date"}),
+          h(Inp,{label:"Compañía",value:infoForm.seguroCompania,onChange:fi("seguroCompania")}),
+          h(Inp,{label:"Nº póliza",value:infoForm.seguroPoliza,onChange:fi("seguroPoliza")}),
+          h(Inp,{label:"Tipo seguro",value:infoForm.seguroTipo,onChange:fi("seguroTipo"),opts:["Todo riesgo","Todo riesgo con franquicia","Terceros ampliado","Terceros básico"]}),
+        ),
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,margin:"10px 0 8px"}},"Tacógrafo"),
+        h(Grid2,null,
+          h(Inp,{label:"Marca",value:infoForm.tacoMarca,onChange:fi("tacoMarca")}),
+          h(Inp,{label:"Modelo",value:infoForm.tacoModelo,onChange:fi("tacoModelo")}),
+          h(Inp,{label:"Código / Nº serie",value:infoForm.tacoCodigo,onChange:fi("tacoCodigo")}),
+          h(Inp,{label:"Fecha renovación/caducidad",value:infoForm.tacoFechaRenov,onChange:fi("tacoFechaRenov"),type:"date"}),
+        ),
+        h(Inp,{label:"Observaciones",value:infoForm.obs,onChange:fi("obs"),rows:2}),
+      )
+    ),
+
+    /* TAB OT */
+    tab==="ot"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},h(Btn,{sm:true,onClick:()=>openM("ot",defOT,null)},"+ Nueva OT")),
+      myOTs.length===0?h("div",{style:{textAlign:"center",padding:32,color:C.txtM}},"Sin intervenciones registradas"):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+        myOTs.map(ot=>{
+          const ec=OEC[ot.estadoOT]||OEC["Abierta"];
+          const cs=ot.nivel?.startsWith("N1")?"red":ot.nivel?.startsWith("N2")?"orange":"green";
+          return h(Card,{key:ot.id},
+            h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-start"}},
+              h("div",{style:{flex:1}},
+                h("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:5,flexWrap:"wrap"}},
+                  h("span",{style:{fontWeight:700,color:C.acc,fontSize:12}},`OT-${ot.id.slice(0,6).toUpperCase()}`),
+                  h("span",{style:{background:ec.bg,color:ec.txt,border:`1px solid ${ec.bdr}`,borderRadius:99,padding:"1px 7px",fontSize:11,fontWeight:600}},ot.estadoOT),
+                  ot.nivel&&h(Badge,{label:ot.nivel,scheme:cs}),
+                  ot.tallerExterno&&h("span",{style:{fontSize:10,color:C.ora,background:C.oraB,border:`1px solid ${C.oraD}`,borderRadius:99,padding:"1px 6px",fontWeight:600}},"EXTERNO"),
+                  h("span",{style:{fontSize:11,color:C.txtM}},ot.fecha," · ",ot.tipo),
+                  ot.km&&h("span",{style:{fontSize:11,color:C.txtM}},`· ${Number(ot.km).toLocaleString()} km`)
+                ),
+                ot.tallerExterno&&ot.proveedorTaller&&h("div",{style:{fontSize:12,color:C.ora,marginBottom:2}},h("strong",null,"Proveedor: "),ot.proveedorTaller),
+                ot.sintoma&&h("div",{style:{fontSize:12,color:C.txtS,marginBottom:2}},h("strong",null,"Síntoma: "),ot.sintoma),
+                ot.trabajos&&h("div",{style:{fontSize:12,color:C.txt}},h("strong",null,"Trabajos: "),ot.trabajos),
+                ot.recambios&&h("div",{style:{fontSize:12,color:C.txtS}},h("strong",null,"Recambios: "),ot.recambios),
+              ),
+              h("div",{style:{textAlign:"right",fontSize:12,color:C.txtS,minWidth:70}},
+                ot.horas&&h("div",null,h("strong",null,ot.horas,"h")," M.O."),
+                (ot.costeOT||ot.costeRec)&&h("div",{style:{color:C.ora,fontWeight:700}},(((+ot.costeOT||0)+(+ot.costeRec||0)).toFixed(0)),"€"),
+                h("button",{onClick:()=>openM("ot",ot,ot.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginTop:4}},"✏ Editar"),
+                h("button",{onClick:()=>delOT(ot.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11,marginTop:2}},"✕ Eliminar")
+              )
+            )
+          );
+        })
+      )
+    ),
+
+    /* TAB ACEITE */
+    tab==="ace"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},h(Btn,{sm:true,onClick:()=>openM("ace",defAce,null)},"+ Registrar cambio aceite")),
+      myAce.length===0?h("div",{style:{textAlign:"center",padding:32,color:C.txtM}},"Sin cambios de aceite"):
+      h("div",{style:{overflowX:"auto"}},
+        h("table",{style:{width:"100%",fontSize:12}},
+          h("thead",null,h("tr",{style:{background:C.gryB}},
+            ["Fecha","Km","Aceite","Visc.","L","F.Ac.","F.Ai.","F.Ga.","AdBlue","Km prox.","Coste",""].map(th=>h("th",{key:th,style:{padding:"6px 8px",textAlign:"left",fontSize:11,color:C.txtS,fontWeight:600,borderBottom:`1px solid ${C.bdr}`}},th))
+          )),
+          h("tbody",null,myAce.map((a,i)=>h("tr",{key:a.id,style:{background:i%2?C.gryB:C.card}},
+            h("td",{style:{padding:"6px 8px"}},a.fecha),
+            h("td",{style:{padding:"6px 8px",textAlign:"right"}},Number(a.km).toLocaleString()),
+            h("td",{style:{padding:"6px 8px"}},a.marcaAceite),
+            h("td",{style:{padding:"6px 8px"}},a.visc),
+            h("td",{style:{padding:"6px 8px",textAlign:"right"}},a.litros),
+            ...[a.fAceite,a.fAire,a.fGasoil,a.fAdblue].map((f,fi)=>h("td",{key:fi,style:{padding:"6px 8px",textAlign:"center",color:f?C.grn:C.txtM}},f?"✔":"–")),
+            h("td",{style:{padding:"6px 8px",textAlign:"right",color:C.grn,fontWeight:600}},(Number(a.km)+(Number(a.intervalo)||20000)).toLocaleString()),
+            h("td",{style:{padding:"6px 8px",textAlign:"right",color:C.ora}},a.coste?`${a.coste}€`:""),
+            h("td",{style:{padding:"6px 8px",whiteSpace:"nowrap"}},
+              h("button",{onClick:()=>openM("ace",a,a.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginRight:4}},"✏"),
+              h("button",{onClick:()=>delAce(a.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11}},"✕"))
+          )))
+        )
+      )
+    ),
+
+    /* TAB NEUMÁTICOS */
+    tab==="neu"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},h(Btn,{sm:true,onClick:()=>openM("neu",defNeu,null)},"+ Registrar cambio neumático")),
+      myNeu.length===0?h("div",{style:{textAlign:"center",padding:32,color:C.txtM}},"Sin cambios de neumáticos"):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+        myNeu.map(n=>{
+          const ps=parseFloat(n.profSal);
+          const alc=ps<1.6?"red":ps<3?"orange":"green";
+          return h(Card,{key:n.id},
+            h("div",{style:{display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-start"}},
+              h("div",{style:{flex:1}},
+                h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:3}},
+                  h("strong",{style:{fontSize:13}},n.posicion),
+                  h(Badge,{label:n.tipo,scheme:n.tipo==="Nuevo"?"green":"yellow"}),
+                  h("span",{style:{fontSize:11,color:C.txtM}},n.fecha," · ",Number(n.km).toLocaleString()," km")
+                ),
+                h("div",{style:{fontSize:12,color:C.txtS}},n.marca," · ",n.medida),
+                n.motivo&&h("div",{style:{fontSize:11,color:C.txtM}},"Motivo: ",n.motivo)
+              ),
+              h("div",{style:{textAlign:"right",fontSize:12}},
+                n.profSal&&h("div",null,h(Badge,{label:`Saliente: ${n.profSal}mm`,scheme:alc})),
+                n.profNvo&&h("div",{style:{color:C.txtS,marginTop:3}},"Nuevo: ",n.profNvo,"mm"),
+                n.presion&&h("div",{style:{color:C.txtS}},n.presion," bar"),
+                n.coste&&h("div",{style:{color:C.ora,fontWeight:700}},n.coste,"€"),
+                h("button",{onClick:()=>openM("neu",n,n.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginTop:4}},"✏ Editar"),
+                h("button",{onClick:()=>delNeu(n.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11,marginTop:2}},"✕ Eliminar")
+              )
+            )
+          );
+        })
+      )
+    ),
+
+    /* TAB SANCIONES */
+    tab==="san"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},h(Btn,{sm:true,onClick:()=>openM("san",defSan,null)},"+ Registrar sanción")),
+      mySan.length===0?h("div",{style:{textAlign:"center",padding:32,color:C.txtM}},"Sin sanciones registradas"):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+        mySan.map(s=>{
+          const d=diasHasta(s.fechaLimite);
+          const sc=s.estado==="Pendiente"?"red":s.estado==="Pagada"?"green":s.estado==="Recurrida"?"blue":"gray";
+          const sAC=AC[sc]||AC.gray;
+          return h(Card,{key:s.id},
+            h("div",{style:{display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-start"}},
+              h("div",{style:{flex:1}},
+                h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:3}},
+                  h("strong",{style:{fontSize:13}},s.tipo||"Infracción"),
+                  h("span",{style:{background:sAC.bg,color:sAC.txt,border:`1px solid ${sAC.bdr}`,borderRadius:99,padding:"1px 7px",fontSize:11,fontWeight:600}},s.estado),
+                  h("span",{style:{fontSize:11,color:C.txtM}},s.fechaInf)
+                ),
+                s.conductor&&h("div",{style:{fontSize:12,color:C.txtS}},"Conductor: ",s.conductor),
+                s.lugar&&h("div",{style:{fontSize:12,color:C.txtM}},s.lugar),
+                s.expediente&&h("div",{style:{fontSize:11,color:C.txtM}},"Exp: ",s.expediente)
+              ),
+              h("div",{style:{textAlign:"right",fontSize:12}},
+                s.importe&&h("div",{style:{fontSize:20,fontWeight:800,color:C.red}},s.importe,"€"),
+                s.puntos&&h("div",{style:{color:C.ora}},s.puntos," puntos"),
+                s.estado==="Pendiente"&&s.fechaLimite&&h("div",{style:{color:d<0?C.red:d<10?C.ora:C.txtM,fontSize:11,marginTop:3}},d<0?"Vencido":d===0?"Hoy":`${d} días`),
+                h("button",{onClick:()=>openM("san",s,s.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginTop:4}},"✏ Editar"),
+                h("button",{onClick:()=>delSan(s.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11,marginTop:2}},"✕ Eliminar")
+              )
+            )
+          );
+        })
+      )
+    ),
+
+    /* TAB EXTINTORES */
+    tab==="ext"&&h("div",null,
+      h("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:8}},h(Btn,{sm:true,onClick:()=>openM("ext",defExt,null)},"+ Añadir elemento")),
+      myExt.length===0?h("div",{style:{textAlign:"center",padding:32,color:C.txtM}},"Sin elementos registrados"):
+      h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:8}},
+        myExt.map(e=>{
+          const d=diasHasta(e.proximaRev);
+          const al=e.estado==="Caducado"||d<0?"red":d<30?"orange":d<60?"yellow":"green";
+          const sc=AC[al];
+          return h(Card,{key:e.id,style:{borderLeft:`4px solid ${sc.bdr}`}},
+            h("div",{style:{fontWeight:700,fontSize:13,marginBottom:4}},e.tipoElem),
+            h("div",{style:{fontSize:12,color:C.txtS,marginBottom:3}},e.posicion),
+            e.tipoAgente&&e.tipoAgente!=="N/A"&&h("div",{style:{fontSize:11,color:C.txtS}},e.tipoAgente," · ",e.capacidad,"kg"),
+            h("div",{style:{marginTop:8,display:"flex",alignItems:"center",justifyContent:"space-between"}},
+              h("span",{style:{background:sc.bg,color:sc.txt,border:`1px solid ${sc.bdr}`,borderRadius:99,padding:"2px 8px",fontSize:11,fontWeight:600}},e.estado),
+              e.proximaRev&&h("span",{style:{fontSize:11,color:sc.txt}},e.proximaRev)
+            ),
+            d!==null&&h("div",{style:{fontSize:11,color:sc.txt,marginTop:3,textAlign:"right"}},d<0?`Vencido hace ${Math.abs(d)}d`:d===0?"Caduca hoy":`${d}d`),
+            h("div",{style:{display:"flex",gap:8,marginTop:6}},
+              h("button",{onClick:()=>openM("ext",e,e.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11}},"✏ Editar"),
+              h("button",{onClick:()=>delExt(e.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11}},"✕ Eliminar"))
+          );
+        })
+      )
+    ),
+
+    /* TAB SEGURO */
+    tab==="seg"&&h("div",null,
+      h("div",{style:{display:"flex",gap:6,justifyContent:"flex-end",marginBottom:8}},
+        h(Btn,{sm:true,variant:"ghost",onClick:()=>openM("seg",defSeg,null)},"+ Registrar póliza"),
+        h(Btn,{sm:true,onClick:()=>openM("sin",defSin,null)},"+ Declarar siniestro"),
+      ),
+      // Datos seguro del vehículo
+      (v.seguroCompania||v.seguroPoliza||v.seguroVto)&&h(Card,{style:{marginBottom:12,borderLeft:`4px solid ${seg.c==="green"?C.grnD:seg.c==="red"?C.redD:C.oraD}`}},
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,marginBottom:8}},"Datos póliza actual"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8}},
+          [["Compañía",v.seguroCompania],["Nº póliza",v.seguroPoliza],["Tipo",v.seguroTipo],["Vencimiento",v.seguroVto]].filter(([,val])=>val).map(([k,val])=>
+            h("div",{key:k,style:{padding:"6px 10px",background:C.gryB,borderRadius:6}},
+              h("div",{style:{fontSize:10,color:C.txtS}}),
+              h("div",{style:{fontSize:11,color:C.txtM,marginBottom:2}},k),
+              h("div",{style:{fontSize:13,fontWeight:600,color:C.txt}},val)
+            )
+          ),
+          h("div",{style:{padding:"6px 10px",background:AC[seg.c]?.bg||C.gryB,borderRadius:6,border:`1px solid ${AC[seg.c]?.bdr||C.bdr}`}},
+            h("div",{style:{fontSize:11,color:C.txtM,marginBottom:2}},"Estado"),
+            h("div",{style:{fontSize:13,fontWeight:700,color:AC[seg.c]?.txt||C.txt}},seg.t)
+          )
+        )
+      ),
+      // Historial pólizas
+      polizas.length>0&&h("div",{style:{marginBottom:12}},
+        h("div",{style:{fontWeight:600,fontSize:13,color:C.txt,marginBottom:8}},"Historial de pólizas"),
+        h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+          polizas.map(s=>h(Card,{key:s.id},
+            h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-start"}},
+              h("div",{style:{flex:1}},
+                h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:3}},
+                  h("strong",{style:{fontSize:13}},s.compania||"—"),
+                  s.poliza&&h("span",{style:{fontSize:11,color:C.txtM}},"Póliza: ",s.poliza),
+                  s.tipo&&h(Badge,{label:s.tipo,scheme:"blue"}),
+                ),
+                h("div",{style:{fontSize:12,color:C.txtS}},"Alta: ",s.fecha,"  Vencimiento: ",s.vencimiento||"—"),
+              ),
+              h("div",{style:{textAlign:"right",fontSize:12}},
+                s.prima&&h("div",{style:{fontSize:16,fontWeight:700,color:C.acc}},`${s.prima}€`," prima"),
+                h("button",{onClick:()=>openM("seg",s,s.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginTop:4}},"✏ Editar"),
+                h("button",{onClick:()=>delSeg(s.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11,marginTop:2}},"✕")
+              )
+            )
+          ))
+        )
+      ),
+      // Siniestros
+      h("div",{style:{fontWeight:600,fontSize:13,color:C.txt,marginBottom:8}},`Siniestros declarados (${siniestros.length})`),
+      siniestros.length===0?h("div",{style:{textAlign:"center",padding:20,color:C.txtM,background:C.gryB,borderRadius:8}},"Sin siniestros declarados"):
+      h("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+        siniestros.map(s=>{
+          const sc=s.estado==="Abierto"?"orange":s.estado==="Cerrado"?"green":"gray";
+          return h(Card,{key:s.id,style:{borderLeft:`4px solid ${AC[sc].bdr}`}},
+            h("div",{style:{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-start"}},
+              h("div",{style:{flex:1}},
+                h("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:3}},
+                  h("strong",{style:{fontSize:13}},s.tipo||"Siniestro"),
+                  h(Badge,{label:s.estado,scheme:sc}),
+                  s.culpa&&h(Badge,{label:"Culpa: "+s.culpa,scheme:s.culpa==="Propia"?"red":"gray"}),
+                  h("span",{style:{fontSize:11,color:C.txtM}},s.fecha)
+                ),
+                s.conductor&&h("div",{style:{fontSize:12,color:C.txtS}},"Conductor: ",s.conductor),
+                s.descripcion&&h("div",{style:{fontSize:12,color:C.txtS}},"Descripción: ",s.descripcion),
+                s.danos&&h("div",{style:{fontSize:12,color:C.txtM}},"Daños: ",s.danos),
+              ),
+              h("div",{style:{textAlign:"right",fontSize:12}},
+                s.importeRep&&h("div",{style:{fontSize:16,fontWeight:700,color:C.ora}},`${s.importeRep}€`),
+                h("button",{onClick:()=>openM("sin",s,s.id),style:{background:"none",border:"none",color:C.acc,cursor:"pointer",fontSize:11,marginTop:4}},"✏ Editar"),
+                h("button",{onClick:()=>delSeg(s.id),style:{background:"none",border:"none",color:C.txtM,cursor:"pointer",fontSize:11,marginTop:2}},"✕")
+              )
+            )
+          );
+        })
+      )
+    ),
+
+    /* TAB TACÓGRAFO */
+    tab==="taco"&&h("div",null,
+      h(Card,{style:{marginBottom:12}},
+        h("div",{style:{fontSize:11,fontWeight:700,color:C.txtS,textTransform:"uppercase",letterSpacing:.5,marginBottom:12}},"Datos del tacógrafo"),
+        h("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:10}},
+          [
+            ["Marca",v.tacoMarca||"—"],
+            ["Modelo",v.tacoModelo||"—"],
+            ["Código / Nº serie",v.tacoCodigo||"—"],
+            ["Fecha renovación/caducidad",v.tacoFechaRenov||"—"],
+          ].map(([k,val])=>h("div",{key:k,style:{padding:"10px 12px",background:C.gryB,borderRadius:7,border:`1px solid ${C.bdr}`}},
+            h("div",{style:{fontSize:11,color:C.txtM,marginBottom:3}},k),
+            h("div",{style:{fontSize:14,fontWeight:600,color:C.txt}},val)
+          )),
+          v.tacoFechaRenov&&h("div",{style:{padding:"10px 12px",background:AC[taco.c]?.bg,borderRadius:7,border:`1px solid ${AC[taco.c]?.bdr}`}},
+            h("div",{style:{fontSize:11,color:AC[taco.c]?.txt,marginBottom:3}},"Estado"),
+            h("div",{style:{fontSize:18,fontWeight:800,color:AC[taco.c]?.txt}},taco.t)
+          )
+        ),
+        !v.tacoMarca&&!v.tacoModelo&&!v.tacoCodigo&&!v.tacoFechaRenov&&
+        h("div",{style:{marginTop:10,padding:12,background:C.yelB,border:`1px solid ${C.yelD}`,borderRadius:7,fontSize:12,color:C.yel}},
+          "⚠ No hay datos del tacógrafo. Edita la información del vehículo para añadirlos."
+        )
+      ),
+      h(Card,{style:{background:C.gryB}},
+        h("div",{style:{fontSize:12,fontWeight:600,color:C.txt,marginBottom:8}},"📋 Recordatorio de obligaciones"),
+        h("ul",{style:{paddingLeft:16,fontSize:12,color:C.txtS,lineHeight:2}},
+          h("li",null,"Inspección obligatoria cada 2 años (vehículos nuevos: cada 6 años primer período)"),
+          h("li",null,"Revisión de la unidad de control por taller autorizado"),
+          h("li",null,"Tarjeta del conductor: renovación cada 5 años"),
+          h("li",null,"Conservar los registros mínimo 1 año (conductores) / 12 meses (empresa)"),
+          h("li",null,"Tiempo de conducción máximo: 9h/día, 56h/semana"),
+        )
+      ),
+      h("div",{style:{marginTop:10,display:"flex",justifyContent:"flex-end"}},
+        h(Btn,{sm:true,variant:"ghost",onClick:()=>{setTab("info");setEditInfo(true);setInfoForm({...v});}},"✏ Editar datos tacógrafo")
+      )
+    ),
+
+    /* MODALES */
+    modal==="ot"&&h(Modal,{title:editId?"Editar OT / Intervención":"Nueva OT / Intervención",onClose:()=>{setModal(null);setEditId(null);},wide:true},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha",value:form.fecha,onChange:ff("fecha"),type:"date",req:true}),
+        h(Inp,{label:"Km",value:form.km,onChange:ff("km"),type:"number"}),
+        h(Inp,{label:"Tipo",value:form.tipo,onChange:ff("tipo"),opts:TIPOS_OT,req:true}),
+        h(Inp,{label:"Nivel avería",value:form.nivel,onChange:ff("nivel"),opts:NIVELES}),
+        h(Inp,{label:"Estado OT",value:form.estadoOT,onChange:ff("estadoOT"),opts:ESTADOS_OT}),
+        h(Inp,{label:"Horas mano de obra",value:form.horas,onChange:ff("horas"),type:"number"}),
+        h(Inp,{label:"Coste mano obra (€)",value:form.costeOT,onChange:ff("costeOT"),type:"number"}),
+        h(Inp,{label:"Coste recambios (€)",value:form.costeRec,onChange:ff("costeRec"),type:"number"}),
+      ),
+      h("label",{style:{display:"flex",alignItems:"center",gap:8,fontSize:13,margin:"4px 0 8px",cursor:"pointer"}},
+        h("input",{type:"checkbox",checked:!!form.tallerExterno,onChange:e=>{setForm(p=>({...p,tallerExterno:e.target.checked,tipo:e.target.checked?"Reparación taller externo":p.tipo}));},style:{width:15,height:15}}),"Taller externo"),
+      form.tallerExterno&&h(Inp,{label:"Nombre del proveedor / taller externo",value:form.proveedorTaller,onChange:ff("proveedorTaller"),placeholder:"Ej: Talleres García, Mercedes-Benz Servicio..."}),
+      h(Inp,{label:"Síntoma reportado",value:form.sintoma,onChange:ff("sintoma"),rows:2}),
+      h(Inp,{label:"Diagnóstico técnico",value:form.diagnostico,onChange:ff("diagnostico"),rows:2}),
+      h(Inp,{label:"Trabajos realizados",value:form.trabajos,onChange:ff("trabajos"),rows:2}),
+      h(Inp,{label:"Recambios usados",value:form.recambios,onChange:ff("recambios"),rows:2}),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>{setModal(null);setEditId(null);}},"Cancelar"),h(Btn,{onClick:saveOT},editId?"Guardar cambios":"Guardar OT"))
+    ),
+
+    modal==="ace"&&h(Modal,{title:editId?"Editar cambio de aceite":"Registrar cambio de aceite",onClose:()=>{setModal(null);setEditId(null);},},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha",value:form.fecha,onChange:ff("fecha"),type:"date",req:true}),
+        h(Inp,{label:"Km en cambio",value:form.km,onChange:ff("km"),type:"number",req:true}),
+        h(Inp,{label:"Marca aceite",value:form.marcaAceite,onChange:ff("marcaAceite"),opts:["Castrol","Shell","Repsol","Mobil","Total","Otra"]}),
+        h(Inp,{label:"Viscosidad",value:form.visc,onChange:ff("visc"),opts:["5W-30","10W-40","15W-40","5W-40","Otra"]}),
+        h(Inp,{label:"Litros aceite",value:form.litros,onChange:ff("litros"),type:"number"}),
+        h(Inp,{label:"Intervalo siguiente (km)",value:form.intervalo,onChange:ff("intervalo"),type:"number"}),
+        h(Inp,{label:"Coste total (€)",value:form.coste,onChange:ff("coste"),type:"number"}),
+      ),
+      h("div",{style:{display:"flex",gap:16,flexWrap:"wrap",margin:"8px 0 10px"}},
+        [["fAceite","Filtro aceite"],["fAire","Filtro aire"],["fGasoil","Filtro gasoil"],["fAdblue","Filtro AdBlue"]].map(([k,lbl])=>
+          h("label",{key:k,style:{display:"flex",alignItems:"center",gap:6,fontSize:13,cursor:"pointer"}},
+            h("input",{type:"checkbox",checked:!!form[k],onChange:e=>setForm(p=>({...p,[k]:e.target.checked})),style:{width:15,height:15}}),lbl))
+      ),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>{setModal(null);setEditId(null);}},"Cancelar"),h(Btn,{onClick:saveAce},editId?"Guardar cambios":"Guardar"))
+    ),
+
+    modal==="neu"&&h(Modal,{title:editId?"Editar neumático":"Registrar cambio de neumático",onClose:()=>{setModal(null);setEditId(null);},wide:true},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha",value:form.fecha,onChange:ff("fecha"),type:"date",req:true}),
+        h(Inp,{label:"Km en cambio",value:form.km,onChange:ff("km"),type:"number",req:true}),
+        h(Inp,{label:"Posición (1-40 o descripción)",value:form.posicion,onChange:ff("posicion"),opts:POSICIONES_NEU,req:true}),
+        h(Inp,{label:"Tipo",value:form.tipo,onChange:ff("tipo"),opts:["Nuevo","Recauchutado"]}),
+        h("div",null,h(InpMarca,{label:"Marca neumático",value:form.marca,onChange:ff("marca")})),
+        h(Inp,{label:"Medida",value:form.medida,onChange:ff("medida"),placeholder:"Ej: 315/80R22.5"}),
+        h(Inp,{label:"Prof. saliente (mm)",value:form.profSal,onChange:ff("profSal"),type:"number",hint:"Legal mín: 1.6mm"}),
+        h(Inp,{label:"Motivo cambio",value:form.motivo,onChange:ff("motivo"),opts:MOTIVOS_NEU}),
+        h(Inp,{label:"Prof. nuevo (mm)",value:form.profNvo,onChange:ff("profNvo"),type:"number"}),
+        h(Inp,{label:"Presión (bar)",value:form.presion,onChange:ff("presion"),type:"number"}),
+        h(Inp,{label:"Coste neumático (€)",value:form.coste,onChange:ff("coste"),type:"number"}),
+      ),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>{setModal(null);setEditId(null);}},"Cancelar"),h(Btn,{onClick:saveNeu},editId?"Guardar cambios":"Guardar"))
+    ),
+
+    modal==="san"&&h(Modal,{title:"Registrar sanción",onClose:()=>setModal(null),wide:true},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha infracción",value:form.fechaInf,onChange:ff("fechaInf"),type:"date",req:true}),
+        h(Inp,{label:"Conductor",value:form.conductor,onChange:ff("conductor")}),
+        h(Inp,{label:"Tipo infracción",value:form.tipo,onChange:ff("tipo"),opts:TIPOS_INF}),
+        h(Inp,{label:"Gravedad",value:form.gravedad,onChange:ff("gravedad"),opts:["Leve","Grave","Muy grave"]}),
+        h(Inp,{label:"Importe (€)",value:form.importe,onChange:ff("importe"),type:"number"}),
+        h(Inp,{label:"Puntos retirados",value:form.puntos,onChange:ff("puntos"),type:"number"}),
+        h(Inp,{label:"Estado",value:form.estado,onChange:ff("estado"),opts:ESTADOS_SAN}),
+        h(Inp,{label:"Fecha límite pago",value:form.fechaLimite,onChange:ff("fechaLimite"),type:"date",hint:"20 días hábiles → 50% dto."}),
+        h(Inp,{label:"Organismo",value:form.organismo,onChange:ff("organismo")}),
+        h(Inp,{label:"Nº expediente",value:form.expediente,onChange:ff("expediente")}),
+        h(Inp,{label:"Lugar",value:form.lugar,onChange:ff("lugar")}),
+      ),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>setModal(null)},"Cancelar"),h(Btn,{onClick:saveSan},"Guardar"))
+    ),
+
+    modal==="ext"&&h(Modal,{title:"Añadir elemento de seguridad",onClose:()=>setModal(null)},
+      h(Grid2,null,
+        h(Inp,{label:"Tipo elemento",value:form.tipoElem,onChange:ff("tipoElem"),opts:TIPOS_EXT,req:true}),
+        h(Inp,{label:"Posición / ubicación",value:form.posicion,onChange:ff("posicion")}),
+        h(Inp,{label:"Nº serie / ref.",value:form.serie,onChange:ff("serie")}),
+        h(Inp,{label:"Tipo agente extintor",value:form.tipoAgente,onChange:ff("tipoAgente"),opts:["Polvo ABC","CO₂","Agua pulverizada","Espuma","N/A"]}),
+        h(Inp,{label:"Capacidad (kg)",value:form.capacidad,onChange:ff("capacidad"),type:"number"}),
+        h(Inp,{label:"Estado",value:form.estado,onChange:ff("estado"),opts:ESTADOS_EXT}),
+        h(Inp,{label:"Fecha fabricación",value:form.fabricacion,onChange:ff("fabricacion"),type:"date"}),
+        h(Inp,{label:"Última revisión",value:form.ultimaRev,onChange:ff("ultimaRev"),type:"date"}),
+        h(Inp,{label:"Próxima revisión",value:form.proximaRev,onChange:ff("proximaRev"),type:"date",req:true}),
+      ),
+      h("label",{style:{display:"flex",alignItems:"center",gap:8,fontSize:13,margin:"6px 0",cursor:"pointer"}},
+        h("input",{type:"checkbox",checked:!!form.precinto,onChange:e=>setForm(p=>({...p,precinto:e.target.checked})),style:{width:15,height:15}}),"Precinto intacto"),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>setModal(null)},"Cancelar"),h(Btn,{onClick:saveExt},"Guardar"))
+    ),
+
+    modal==="seg"&&h(Modal,{title:"Registrar póliza de seguro",onClose:()=>setModal(null)},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha alta póliza",value:form.fecha,onChange:ff("fecha"),type:"date",req:true}),
+        h(Inp,{label:"Vencimiento",value:form.vencimiento,onChange:ff("vencimiento"),type:"date",req:true}),
+        h(Inp,{label:"Compañía aseguradora",value:form.compania,onChange:ff("compania"),req:true}),
+        h(Inp,{label:"Nº póliza",value:form.poliza,onChange:ff("poliza")}),
+        h(Inp,{label:"Tipo seguro",value:form.tipo,onChange:ff("tipo"),opts:["Todo riesgo","Todo riesgo con franquicia","Terceros ampliado","Terceros básico"]}),
+        h(Inp,{label:"Prima anual (€)",value:form.prima,onChange:ff("prima"),type:"number"}),
+      ),
+      h(Inp,{label:"Observaciones / cobertura adicional",value:form.obs,onChange:ff("obs"),rows:2}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>setModal(null)},"Cancelar"),h(Btn,{onClick:saveSeg},"Guardar"))
+    ),
+
+    modal==="sin"&&h(Modal,{title:"Declarar siniestro",onClose:()=>setModal(null),wide:true},
+      h(Grid2,null,
+        h(Inp,{label:"Fecha siniestro",value:form.fecha,onChange:ff("fecha"),type:"date",req:true}),
+        h(Inp,{label:"Tipo siniestro",value:form.tipo,onChange:ff("tipo"),opts:TIPOS_SINIESTRO,req:true}),
+        h(Inp,{label:"Conductor implicado",value:form.conductor,onChange:ff("conductor")}),
+        h(Inp,{label:"Responsabilidad",value:form.culpa,onChange:ff("culpa"),opts:["Propia","Ajena","Compartida","Sin determinar"]}),
+        h(Inp,{label:"Estado expediente",value:form.estado,onChange:ff("estado"),opts:["Abierto","En tramitación","Cerrado","Pendiente peritaje"]}),
+        h(Inp,{label:"Importe reparación (€)",value:form.importeRep,onChange:ff("importeRep"),type:"number"}),
+      ),
+      h(Inp,{label:"Descripción del siniestro",value:form.descripcion,onChange:ff("descripcion"),rows:3,placeholder:"Descripción detallada de lo ocurrido..."}),
+      h(Inp,{label:"Daños materiales",value:form.danos,onChange:ff("danos"),rows:2}),
+      h(Inp,{label:"Observaciones",value:form.obs,onChange:ff("obs"),rows:1}),
+      h("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}},
+        h(Btn,{variant:"ghost",onClick:()=>setModal(null)},"Cancelar"),h(Btn,{onClick:saveSin},"Guardar siniestro"))
+    )
+  );
+}
+
+/* ── App principal ── */
+function App(){
+  const [loading,setLoading]=useState(true);
+  const [dbReady,setDbReady]=useState(false);
+  const [loginError,setLoginError]=useState(null);
+  const [vehiculos,setVehiculos]=useState([]);
+  const [mecanicos]=useState(MECANICOS_INI);
+  const [intervenciones,setIntervenciones]=useState([]);
+  const [aceite,setAceite]=useState([]);
+  const [neumaticos,setNeumaticos]=useState([]);
+  const [sanciones,setSanciones]=useState([]);
+  const [extintores,setExtintores]=useState([]);
+  const [seguros,setSeguros]=useState([]);
+  const [nav,setNav]=useState("dashboard");
+  const [vSel,setVSel]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [userEmail,setUserEmail]=useState("");
+
+  useEffect(()=>{
+    (async()=>{
+      try{
+        // Inicializar MSAL y manejar redirect
+        const app=getMsal();
+        await app.initialize();
+        await app.handleRedirectPromise();
+        // Cargar datos de SharePoint
+        const [vv,oo,aa,nn,ss,ee,sg]=await Promise.all([
+          spLoad("vehiculos"),spLoad("intervenciones"),spLoad("aceite"),
+          spLoad("neumaticos"),spLoad("sanciones"),spLoad("extintores"),spLoad("seguros"),
+        ]);
+        setVehiculos(vv);
+        setIntervenciones(oo);setAceite(aa);setNeumaticos(nn);setSanciones(ss);setExtintores(ee);setSeguros(sg);
+        // Email del usuario autenticado
+        const accounts=app.getAllAccounts();
+        if(accounts.length>0)setUserEmail(accounts[0].username);
+        setDbReady(true);
+      }catch(e){
+        console.error("Error cargando SharePoint:",e);
+        setLoginError(e.message||"Error de autenticación");
+      }
+      setLoading(false);
+    })();
+  },[]);
+
+  const saveToDb=useCallback(async(col,items)=>{
+    if(!dbReady)return;
+    setSaving(true);
+    try{await spSave(col,items);}
+    catch(e){console.warn("Error guardando en SharePoint:",e);}
+    setSaving(false);
+  },[dbReady]);
+
+  const wrap=(setter,col)=>updater=>{setter(prev=>{const next=typeof updater==="function"?updater(prev):updater;saveToDb(col,next);return next;});};
+  const setV=useCallback(wrap(setVehiculos,"vehiculos"),[saveToDb]);
+  const setI=useCallback(wrap(setIntervenciones,"intervenciones"),[saveToDb]);
+  const setA=useCallback(wrap(setAceite,"aceite"),[saveToDb]);
+  const setN=useCallback(wrap(setNeumaticos,"neumaticos"),[saveToDb]);
+  const setS=useCallback(wrap(setSanciones,"sanciones"),[saveToDb]);
+  const setE=useCallback(wrap(setExtintores,"extintores"),[saveToDb]);
+  const setSg=useCallback(wrap(setSeguros,"seguros"),[saveToDb]);
+
+  const selVeh=v=>{setVSel(vehiculos.find(x=>x.id===v.id)||v);setNav("ficha");};
+  const navItems=[{id:"dashboard",label:"Dashboard"},{id:"flota",label:`Flota (${vehiculos.length})`}];
+
+
+  if(loading)return h("div",{style:{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}},h(Loader));
+
+  if(loginError)return h("div",{style:{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16,padding:24}},
+    h("div",{style:{fontSize:40}},"🔐"),
+    h("div",{style:{fontSize:18,fontWeight:700,color:C.txt}},"Iniciar sesión en Microsoft 365"),
+    h("div",{style:{fontSize:13,color:C.txtS,maxWidth:400,textAlign:"center"}},loginError.includes("popup")||loginError.includes("interaction")?"Haz clic en el botón para autenticarte con tu cuenta de empresa.":"Error: "+loginError),
+    h("button",{onClick:async()=>{setLoginError(null);setLoading(true);try{await getToken();window.location.reload();}catch(e){setLoginError(e.message);setLoading(false);}},style:{background:C.acc,color:"#fff",border:"none",borderRadius:8,padding:"10px 24px",fontSize:14,fontWeight:600,cursor:"pointer"}},"Iniciar sesión con Microsoft")
+  );
+
+  return h("div",{style:{minHeight:"100vh",background:C.bg}},
+    h("div",{style:{background:C.nav,color:"#fff",padding:"0 20px",display:"flex",alignItems:"center",position:"sticky",top:0,zIndex:100}},
+      h("div",{style:{padding:"12px 0",marginRight:28}},
+        h("div",{style:{fontSize:15,fontWeight:800,letterSpacing:-.5}},"🚛 FlotaHorm."),
+        h("div",{style:{fontSize:10,opacity:.45,marginTop:-1}},vehiculos.length+" vehículos")
+      ),
+      navItems.map(n=>h("button",{key:n.id,onClick:()=>{setNav(n.id);setVSel(null);},style:{background:"none",border:"none",color:nav===n.id?"#fff":C.navSub,padding:"16px 12px",cursor:"pointer",fontSize:12,fontWeight:nav===n.id?700:400,borderBottom:nav===n.id?"2px solid #fff":"2px solid transparent",fontFamily:"inherit"}},n.label)),
+      h("div",{style:{marginLeft:"auto",display:"flex",alignItems:"center",gap:10}},
+        saving&&h("span",{style:{fontSize:11,opacity:.7,color:"#fff"}},"💾 Guardando en SharePoint..."),
+        dbReady&&h("span",{style:{fontSize:11,color:C.navSub,background:"rgba(255,255,255,.1)",padding:"2px 8px",borderRadius:99}},`✔ SharePoint · ${userEmail||""}`),
+        h("span",{style:{fontSize:11,opacity:.4,color:"#fff"}},new Date().toLocaleDateString("es-ES",{day:"2-digit",month:"short"}))
+      )
+    ),
+    h("div",{style:{maxWidth:1180,margin:"0 auto",padding:"18px 14px"}},
+      nav==="dashboard"&&h(Dashboard,{vehiculos,intervenciones,aceite:aceite,neumaticos,sanciones,extintores,seguros,onSelectVeh:selVeh}),
+      nav==="flota"&&!vSel&&h(ModVehiculos,{vehiculos,setVehiculos:setV,onSelect:selVeh,intervenciones,aceite,neumaticos,sanciones,seguros}),
+      (nav==="ficha"||nav==="flota")&&vSel&&h(FichaVehiculo,{
+        v:vSel,mecanicos,intervenciones,aceite,neumaticos,sanciones,extintores,seguros,setSeguros:setSg,
+        onBack:()=>{setNav("flota");setVSel(null);},
+        setVehiculos:setV,setIntervenciones:setI,setAceite:setA,setNeumaticos:setN,setSanciones:setS,setExtintores:setE
+      }),
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(h(App));
+</script>
+</body>
+</html>
