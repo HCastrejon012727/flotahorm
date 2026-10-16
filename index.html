@@ -76,6 +76,7 @@ function getMsal(){
   return _msalApp;
 }
 
+let _tokenPromise=null;
 async function getToken(){
   const app=getMsal();
   await app.initialize();
@@ -87,8 +88,10 @@ async function getToken(){
       return r.accessToken;
     }catch{}
   }
-  const r=await app.acquireTokenPopup({scopes});
-  return r.accessToken;
+  // Semáforo: si ya hay un popup abierto, esperar al mismo resultado
+  if(_tokenPromise)return _tokenPromise;
+  _tokenPromise=app.acquireTokenPopup({scopes}).then(r=>{_tokenPromise=null;return r.accessToken;}).catch(e=>{_tokenPromise=null;throw e;});
+  return _tokenPromise;
 }
 
 async function graphFetch(path,opts={}){
@@ -174,7 +177,7 @@ async function spSave(listName,items){
     await batch(toDelete,e=>graphFetch(`/sites/${siteId}/lists/${listId}/items/${e.id}`,{method:"DELETE"}));
     await batch(items,item=>{
       const spId=existMap[item.id];
-      const body={fields:{itemId:item.id,Title:item.id,payload:JSON.stringify(item)}};
+      const body={fields:{itemId:item.id,payload:JSON.stringify(item)}};
       if(spId)return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
       return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
     });
@@ -1526,11 +1529,14 @@ function App(){
         const app=getMsal();
         await app.initialize();
         await app.handleRedirectPromise();
-        // Cargar datos de SharePoint
-        const [vv,oo,aa,nn,ss,ee,sg]=await Promise.all([
-          spLoad("vehiculos"),spLoad("intervenciones"),spLoad("aceite"),
-          spLoad("neumaticos"),spLoad("sanciones"),spLoad("extintores"),spLoad("seguros"),
-        ]);
+        // Cargar datos de SharePoint en secuencia para evitar error interaction_in_progress de MSAL
+        const vv=await spLoad("vehiculos");
+        const oo=await spLoad("intervenciones");
+        const aa=await spLoad("aceite");
+        const nn=await spLoad("neumaticos");
+        const ss=await spLoad("sanciones");
+        const ee=await spLoad("extintores");
+        const sg=await spLoad("seguros");
         setVehiculos(vv);
         setIntervenciones(oo);setAceite(aa);setNeumaticos(nn);setSanciones(ss);setExtintores(ee);setSeguros(sg);
         // Email del usuario autenticado
