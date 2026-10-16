@@ -145,14 +145,28 @@ async function spLoad(listName){
   try{
     const siteId=await getSiteId();
     const listId=await getListId(listName);
-    let items=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=itemId,payload)&$top=500`;
+    const flds=await getFieldNames(siteId,listId,listName);
+    let items=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=${flds.itemId},${flds.payload})&$top=500`;
     while(url){
       const data=await graphFetch(url);
       items=[...items,...(data.value||[])];
       url=data["@odata.nextLink"]?data["@odata.nextLink"].replace("https://graph.microsoft.com/v1.0",""):null;
     }
-    return items.map(i=>{try{return JSON.parse(i.fields.payload);}catch{return null;}}).filter(Boolean);
+    return items.map(i=>{try{return JSON.parse(i.fields[flds.payload]);}catch{return null;}}).filter(Boolean);
   }catch(e){console.warn(`spLoad ${listName}:`,e);return[];}
+}
+
+// Detectar nombres internos reales de los campos (SharePoint puede renombrarlos)
+const _fieldNames={};
+async function getFieldNames(siteId,listId,listName){
+  if(_fieldNames[listName])return _fieldNames[listName];
+  const data=await graphFetch(`/sites/${siteId}/lists/${listId}/columns?$select=name,displayName`);
+  const cols=data.value||[];
+  console.log(`[SP campos ${listName}]`,cols.map(c=>c.name+' ('+c.displayName+')').join(', '));
+  // Buscar el campo cuyo displayName sea "itemId" o "payload"
+  const find=(display)=>cols.find(c=>c.displayName===display||c.name===display)?.name||display;
+  _fieldNames[listName]={itemId:find('itemId'),payload:find('payload')};
+  return _fieldNames[listName];
 }
 
 // Guardar array completo: upsert por itemId usando el campo "id" del objeto
@@ -160,24 +174,26 @@ async function spSave(listName,items){
   try{
     const siteId=await getSiteId();
     const listId=await getListId(listName);
+    const flds=await getFieldNames(siteId,listId,listName);
     // Obtener items existentes para saber cuáles actualizar vs crear
-    let existing=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=id,itemId)&$top=500`;
+    let existing=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=id,${flds.itemId})&$top=500`;
     while(url){
       const data=await graphFetch(url);
       existing=[...existing,...(data.value||[])];
       url=data["@odata.nextLink"]?data["@odata.nextLink"].replace("https://graph.microsoft.com/v1.0",""):null;
     }
     const existMap={};
-    existing.forEach(e=>{if(e.fields?.itemId)existMap[e.fields.itemId]=e.id;});
+    existing.forEach(e=>{const v=e.fields?.[flds.itemId];if(v)existMap[v]=e.id;});
     // Ids que ya no están → borrar
     const newIds=new Set(items.map(i=>i.id));
-    const toDelete=existing.filter(e=>e.fields?.itemId&&!newIds.has(e.fields.itemId));
+    const toDelete=existing.filter(e=>{const v=e.fields?.[flds.itemId];return v&&!newIds.has(v);});
     // Lanzar todo en paralelo por lotes de 10
     const batch=async(arr,fn)=>{for(let i=0;i<arr.length;i+=10)await Promise.all(arr.slice(i,i+10).map(fn));};
     await batch(toDelete,e=>graphFetch(`/sites/${siteId}/lists/${listId}/items/${e.id}`,{method:"DELETE"}));
     await batch(items,item=>{
       const spId=existMap[item.id];
-      const body={fields:{itemId:item.id,payload:JSON.stringify(item)}};
+      const fields={[flds.itemId]:item.id,[flds.payload]:JSON.stringify(item)};
+      const body={fields};
       if(spId)return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
       return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
     });
