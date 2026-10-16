@@ -198,7 +198,9 @@ async function spSave(listName,items){
         const body={fields:{Title:item.id,[flds.payload]:JSON.stringify(item)}};
         return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
       }else{
-        const body={fields:{Title:item.id,[flds.payload]:JSON.stringify(item)}};
+        const payload=JSON.stringify(item);
+        console.log(`[spSave POST] listName=${listName} id=${item.id} payloadLen=${payload.length} body=`,JSON.stringify({fields:{Title:item.id,[flds.payload]:payload}}).substring(0,500));
+        const body={fields:{Title:item.id,[flds.payload]:payload}};
         return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
       }
     });
