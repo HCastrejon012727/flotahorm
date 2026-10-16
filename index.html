@@ -146,7 +146,7 @@ async function spLoad(listName){
     const siteId=await getSiteId();
     const listId=await getListId(listName);
     const flds=await getFieldNames(siteId,listId,listName);
-    let items=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=${flds.itemId},${flds.payload})&$top=500`;
+    let items=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=Title,${flds.payload})&$top=500`;
     while(url){
       const data=await graphFetch(url);
       items=[...items,...(data.value||[])];
@@ -176,26 +176,31 @@ async function spSave(listName,items){
     const listId=await getListId(listName);
     const flds=await getFieldNames(siteId,listId,listName);
     // Obtener items existentes para saber cuáles actualizar vs crear
-    let existing=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=id,${flds.itemId})&$top=500`;
+    let existing=[],url=`/sites/${siteId}/lists/${listId}/items?$expand=fields($select=id,Title)&$top=500`;
     while(url){
       const data=await graphFetch(url);
       existing=[...existing,...(data.value||[])];
       url=data["@odata.nextLink"]?data["@odata.nextLink"].replace("https://graph.microsoft.com/v1.0",""):null;
     }
     const existMap={};
-    existing.forEach(e=>{const v=e.fields?.[flds.itemId];if(v)existMap[v]=e.id;});
+    existing.forEach(e=>{const v=e.fields?.Title;if(v)existMap[v]=e.id;});
     // Ids que ya no están → borrar
     const newIds=new Set(items.map(i=>i.id));
-    const toDelete=existing.filter(e=>{const v=e.fields?.[flds.itemId];return v&&!newIds.has(v);});
+    const toDelete=existing.filter(e=>{const v=e.fields?.Title;return v&&!newIds.has(v);});
     // Lanzar todo en paralelo por lotes de 10
     const batch=async(arr,fn)=>{for(let i=0;i<arr.length;i+=10)await Promise.all(arr.slice(i,i+10).map(fn));};
     await batch(toDelete,e=>graphFetch(`/sites/${siteId}/lists/${listId}/items/${e.id}`,{method:"DELETE"}));
     await batch(items,item=>{
       const spId=existMap[item.id];
-      const fields={[flds.itemId]:item.id,[flds.payload]:JSON.stringify(item)};
-      const body={fields};
-      if(spId)return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
-      return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
+      // Title es el único campo que SharePoint acepta siempre en POST/PATCH
+      // itemId lo añadimos solo en PATCH (ya existe el item)
+      if(spId){
+        const body={fields:{Title:item.id,[flds.payload]:JSON.stringify(item)}};
+        return graphFetch(`/sites/${siteId}/lists/${listId}/items/${spId}`,{method:"PATCH",body});
+      }else{
+        const body={fields:{Title:item.id,[flds.payload]:JSON.stringify(item)}};
+        return graphFetch(`/sites/${siteId}/lists/${listId}/items`,{method:"POST",body});
+      }
     });
   }catch(e){console.warn(`spSave ${listName}:`,e);}
 }
